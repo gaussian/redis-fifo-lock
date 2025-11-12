@@ -200,9 +200,7 @@ class AsyncStreamGate:
                 self.msg_id = None
 
             async def __aenter__(self):
-                self.owner, self.msg_id = await self.gate.acquire(
-                    timeout=self.timeout
-                )
+                self.owner, self.msg_id = await self.gate.acquire(timeout=self.timeout)
                 return self
 
             async def __aexit__(self, exc_type, exc, tb):

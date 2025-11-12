@@ -77,9 +77,7 @@ class TestAsyncStreamGateEnsureGroup:
     """Tests for ensure_group method."""
 
     @pytest.mark.asyncio
-    async def test_ensure_group_creates_group(
-        self, async_stream_gate, mock_async_redis
-    ):
+    async def test_ensure_group_creates_group(self, async_stream_gate, mock_async_redis):
         """Test that ensure_group creates the consumer group."""
         await async_stream_gate.ensure_group()
         mock_async_redis.xgroup_create.assert_called_once_with(
@@ -164,9 +162,7 @@ class TestAsyncStreamGateRelease:
     """Tests for release method."""
 
     @pytest.mark.asyncio
-    async def test_release_with_pending_entry(
-        self, async_stream_gate, mock_async_redis
-    ):
+    async def test_release_with_pending_entry(self, async_stream_gate, mock_async_redis):
         """Test release dispatches the next entry."""
         mock_async_redis.get.return_value = b"1234567890-0"
         mock_async_redis.xautoclaim.return_value = ("0-0", [])
@@ -202,9 +198,7 @@ class TestAsyncStreamGateRelease:
         mock_async_redis.delete.assert_called_with("gate:last-dispatched")
 
     @pytest.mark.asyncio
-    async def test_release_with_crash_recovery(
-        self, async_stream_gate, mock_async_redis
-    ):
+    async def test_release_with_crash_recovery(self, async_stream_gate, mock_async_redis):
         """Test release performs crash recovery."""
         mock_async_redis.get.return_value = None
         mock_async_redis.xautoclaim.return_value = (
