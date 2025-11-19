@@ -65,10 +65,40 @@ class AsyncStreamGate:
     async def ensure_group(self) -> None:
         """Create stream + group if missing."""
         try:
-            await self.r.xgroup_create(self.stream, self.group, id="$", mkstream=True)
+            await self.r.xgroup_create(self.stream, self.group, id="0", mkstream=True)
         except redis.ResponseError as e:
             if "BUSYGROUP" not in str(e):
                 raise
+
+    async def _dispatch_waiter(self, entry: Tuple[str, dict]) -> Optional[str]:
+        """
+        Extract owner from stream entry and signal them.
+
+        Args:
+            entry: Tuple of (message_id, fields) from XREADGROUP
+
+        Returns:
+            The owner that was dispatched, or None if no valid owner
+        """
+        msg_id, fields = entry
+
+        # Handle both decoded (string keys) and non-decoded (bytes keys) responses
+        owner = fields.get("owner") or fields.get(b"owner", b"")
+        if isinstance(owner, bytes):
+            owner = owner.decode()
+
+        if not owner:
+            return None
+
+        # Signal the waiter
+        sig = self.sig_prefix + owner
+        await self.r.lpush(sig, 1)
+        await self.r.pexpire(sig, self.sig_ttl_ms)
+
+        # Mark this message as the currently dispatched one
+        await self.r.set(self.last_key, msg_id)
+
+        return owner
 
     async def acquire(self, timeout: Optional[int] = None) -> Tuple[str, str]:
         """
@@ -89,7 +119,30 @@ class AsyncStreamGate:
         # 1) Enqueue your ticket
         msg_id = await self.r.xadd(self.stream, {"owner": owner})
 
-        # 2) Block until the dispatcher signals you
+        # 2) Try to become the lock holder (if no one is holding it)
+        acquired = await self.r.set(self.last_key, msg_id, nx=True)
+
+        if acquired:
+            # We got the lock! Claim our message in the consumer group via XREADGROUP
+            res = await self.r.xreadgroup(
+                self.group,
+                self.adv_consumer,
+                streams={self.stream: ">"},
+                count=1,
+                block=1,  # 1ms timeout (essentially non-blocking, block=0 means wait forever!)
+            )
+            # Validate that we got our message
+            if not res or not res[0] or not res[0][1]:
+                raise RuntimeError(
+                    f"XREADGROUP returned no messages after SETNX succeeded. "
+                    f"Expected to claim msg_id {msg_id}"
+                )
+            # Signal ourselves - we'll wait on BLPOP below to consume the signal
+            sig_key = self.sig_prefix + owner
+            await self.r.lpush(sig_key, 1)
+            await self.r.pexpire(sig_key, self.sig_ttl_ms)
+
+        # 3) Block until the dispatcher signals you (could be ourselves or previous holder)
         sig_key = self.sig_prefix + owner
         res = await self.r.blpop(sig_key, timeout=timeout)
 
@@ -104,25 +157,11 @@ class AsyncStreamGate:
 
         return owner, msg_id
 
-    async def release(self, owner: str, msg_id: str) -> None:
+    async def _dispatch_next_async(self) -> None:
         """
-        Holder calls this when done. Acks the currently active entry (if any) and
-        dispatches the next in FIFO. Best-effort crash recovery first.
-
-        Args:
-            owner: Owner UUID (currently unused but kept for API compatibility)
-            msg_id: Stream message ID (currently unused but kept for API compatibility)
+        Background task to dispatch the next waiter after release completes.
+        This ensures release() returns before the next waiter is signaled.
         """
-        await self.ensure_group()
-
-        # 1) Ack previously dispatched message (idempotent)
-        last = await self.r.get(self.last_key)
-        if last:
-            try:
-                await self.r.xack(self.stream, self.group, last.decode())
-            except Exception:
-                pass  # already acked or gone
-
         # 2) Crash recovery: reclaim the oldest idle pending entry (if any) and re-signal
         try:
             next_start, claimed = await self.r.xautoclaim(
@@ -134,14 +173,8 @@ class AsyncStreamGate:
                 count=1,
             )
             if claimed:
-                stuck_id, fields = claimed[0]
-                owner2 = fields.get(b"owner", b"").decode()
-                if owner2:
-                    sig = self.sig_prefix + owner2
-                    # wake the rightful owner
-                    await self.r.lpush(sig, 1)
-                    await self.r.pexpire(sig, self.sig_ttl_ms)
-                    await self.r.set(self.last_key, stuck_id)
+                dispatched = await self._dispatch_waiter(claimed[0])
+                if dispatched:
                     return
         except Exception:
             # recovery is best-effort; proceed to normal dispatch
@@ -153,7 +186,7 @@ class AsyncStreamGate:
             self.adv_consumer,
             streams={self.stream: ">"},
             count=1,
-            block=0,
+            block=1,  # 1ms timeout (essentially non-blocking, block=0 means wait forever!)
         )
 
         if not res:
@@ -162,13 +195,30 @@ class AsyncStreamGate:
             return
 
         _, entries = res[0]
-        next_id, fields = entries[0]
-        owner3 = fields.get(b"owner", b"").decode()
-        if owner3:
-            sig = self.sig_prefix + owner3
-            await self.r.lpush(sig, 1)
-            await self.r.pexpire(sig, self.sig_ttl_ms)
-            await self.r.set(self.last_key, next_id)
+        await self._dispatch_waiter(entries[0])
+
+    async def release(self, owner: str, msg_id: str) -> None:
+        """
+        Holder calls this when done. Acks the currently active entry (if any) and
+        dispatches the next in FIFO. Best-effort crash recovery first.
+
+        Args:
+            owner: Owner UUID (currently unused but kept for API compatibility)
+            msg_id: Stream message ID to acknowledge
+        """
+        await self.ensure_group()
+
+        # 1) Ack OUR OWN message (not from last_key!)
+        try:
+            await self.r.xack(self.stream, self.group, msg_id)
+        except Exception:
+            pass  # already acked or gone
+
+        # Schedule dispatch as background task to ensure release() completes first
+        # Use create_task with name for better debugging, task will complete on its own
+        task = asyncio.create_task(self._dispatch_next_async())
+        # Don't await - let it run in background, but add done callback to handle errors
+        task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
 
     async def cancel(self, owner: str, msg_id: str) -> None:
         """
