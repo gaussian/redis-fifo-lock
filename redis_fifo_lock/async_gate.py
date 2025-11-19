@@ -100,9 +100,102 @@ class AsyncStreamGate:
 
         return owner
 
+    async def _recover_and_maybe_dispatch(self) -> bool:
+        """
+        Attempt crash recovery and normal dispatch. Called by waiters and release().
+
+        This implements:
+        1. Crash recovery via XAUTOCLAIM (reclaim idle entries)
+        2. Dead holder timeout: XACK entries idle >= 2 minutes
+        3. Normal dispatch via XREADGROUP (read next new message)
+
+        Returns:
+            True if a waiter was dispatched, False if queue is empty
+        """
+        # Phase 1: Crash recovery - reclaim idle pending entries
+        try:
+            next_start, claimed = await self.r.xautoclaim(
+                self.stream,
+                self.group,
+                self.adv_consumer,
+                min_idle_time=self.claim_idle_ms,
+                start_id="0-0",
+                count=1,
+            )
+            if claimed:
+                msg_id, fields = claimed[0]
+
+                # Check if this entry has been idle for >= 2 minutes (120 seconds = 120000 ms)
+                # If so, consider the holder truly dead and XACK to remove from queue
+                DEAD_HOLDER_TIMEOUT_MS = 120_000
+
+                # Get the pending entry info to check idle time
+                try:
+                    pending_info = await self.r.xpending_range(
+                        self.stream,
+                        self.group,
+                        min=msg_id,
+                        max=msg_id,
+                        count=1,
+                    )
+
+                    if pending_info and len(pending_info) > 0:
+                        idle_time_ms = pending_info[0].get("time_since_delivered", 0)
+
+                        if idle_time_ms >= DEAD_HOLDER_TIMEOUT_MS:
+                            # Dead holder - XACK to remove from queue and advance
+                            await self.r.xack(self.stream, self.group, msg_id)
+                            # Don't dispatch this one, fall through to read next message
+                        else:
+                            # Still might be processing, re-signal the same owner
+                            dispatched = await self._dispatch_waiter(claimed[0])
+                            if dispatched:
+                                return True
+                    else:
+                        # No pending info, try to dispatch anyway (best-effort)
+                        dispatched = await self._dispatch_waiter(claimed[0])
+                        if dispatched:
+                            return True
+                except Exception:
+                    # If we can't check idle time, try to dispatch (best-effort)
+                    dispatched = await self._dispatch_waiter(claimed[0])
+                    if dispatched:
+                        return True
+        except Exception:
+            # Recovery is best-effort; proceed to normal dispatch
+            pass
+
+        # Phase 2: Normal dispatch - read next new message
+        try:
+            res = await self.r.xreadgroup(
+                self.group,
+                self.adv_consumer,
+                streams={self.stream: ">"},
+                count=1,
+                block=1,  # 1ms timeout (essentially non-blocking)
+            )
+
+            if not res:
+                # Queue empty → clear pointer
+                await self.r.delete(self.last_key)
+                return False
+
+            _, entries = res[0]
+            if entries:
+                await self._dispatch_waiter(entries[0])
+                return True
+        except Exception:
+            pass
+
+        return False
+
     async def acquire(self, timeout: Optional[int] = None) -> Tuple[str, str]:
         """
         Join the FIFO and block until dispatched.
+
+        Implements waiter-driven crash recovery: BLPOP runs in a loop with 5-second
+        internal timeout. On each wake, if not signaled, the waiter calls recovery
+        logic to detect and advance past dead holders.
 
         Args:
             timeout: Seconds to wait for dispatch; None = infinite
@@ -143,70 +236,85 @@ class AsyncStreamGate:
             await self.r.pexpire(sig_key, self.sig_ttl_ms)
 
         # 3) Block until the dispatcher signals you (could be ourselves or previous holder)
+        # Use internal timeout loop for waiter-driven crash recovery
         sig_key = self.sig_prefix + owner
-        res = await self.r.blpop(sig_key, timeout=timeout)
+        deadline = None if timeout is None else (asyncio.get_event_loop().time() + timeout)
 
-        if res is None:
-            # Timed out ⇒ best-effort cancel our ticket
+        while True:
+            # Internal wait: 5 seconds for periodic recovery checks
+            internal_timeout = 5
+            if deadline is not None:
+                remaining = deadline - asyncio.get_event_loop().time()
+                if remaining <= 0:
+                    # User timeout reached
+                    await self._cancel_ticket(owner, msg_id, sig_key)
+                    raise asyncio.TimeoutError("acquire timed out waiting for dispatch")
+                # Use smaller of internal timeout or remaining time
+                internal_timeout = min(internal_timeout, max(1, int(remaining)))
+
+            res = await self.r.blpop(sig_key, timeout=internal_timeout)
+
+            if res is not None:
+                # Got our signal → it's our turn
+                return owner, msg_id
+
+            # We woke up because internal timeout hit, not because we were signaled
+            # Run crash/recovery logic to detect dead leaders and advance the queue
             try:
-                await self.r.xdel(self.stream, msg_id)
-            finally:
-                # drain possible late signal
-                await self.r.delete(sig_key)
-            raise asyncio.TimeoutError("acquire timed out waiting for dispatch")
+                await self._recover_and_maybe_dispatch()
+            except Exception:
+                # Recovery is best-effort, continue waiting
+                pass
+            # Loop and BLPOP again
 
-        return owner, msg_id
+    async def _cancel_ticket(self, owner: str, msg_id: str, sig_key: str) -> None:
+        """
+        Best-effort cleanup when acquire times out.
+
+        Args:
+            owner: Owner UUID
+            msg_id: Stream message ID
+            sig_key: Signal key for this owner
+        """
+        try:
+            await self.r.xdel(self.stream, msg_id)
+        finally:
+            # Drain possible late signal
+            await self.r.delete(sig_key)
 
     async def _dispatch_next_async(self) -> None:
         """
         Background task to dispatch the next waiter after release completes.
         This ensures release() returns before the next waiter is signaled.
+
+        Delegates to _recover_and_maybe_dispatch() for all recovery and dispatch logic.
         """
-        # 2) Crash recovery: reclaim the oldest idle pending entry (if any) and re-signal
-        try:
-            next_start, claimed = await self.r.xautoclaim(
-                self.stream,
-                self.group,
-                self.adv_consumer,
-                min_idle_time=self.claim_idle_ms,
-                start_id="0-0",
-                count=1,
-            )
-            if claimed:
-                dispatched = await self._dispatch_waiter(claimed[0])
-                if dispatched:
-                    return
-        except Exception:
-            # recovery is best-effort; proceed to normal dispatch
-            pass
-
-        # 3) Normal dispatch: deliver next new message in order
-        res = await self.r.xreadgroup(
-            self.group,
-            self.adv_consumer,
-            streams={self.stream: ">"},
-            count=1,
-            block=1,  # 1ms timeout (essentially non-blocking, block=0 means wait forever!)
-        )
-
-        if not res:
-            # queue empty → clear pointer
-            await self.r.delete(self.last_key)
-            return
-
-        _, entries = res[0]
-        await self._dispatch_waiter(entries[0])
+        await self._recover_and_maybe_dispatch()
 
     async def release(self, owner: str, msg_id: str) -> None:
         """
         Holder calls this when done. Acks the currently active entry (if any) and
         dispatches the next in FIFO. Best-effort crash recovery first.
 
+        Guards against double-release: only the current holder (last_key == msg_id)
+        can drive dispatch. This prevents race conditions and maintains invariants.
+
         Args:
             owner: Owner UUID (currently unused but kept for API compatibility)
             msg_id: Stream message ID to acknowledge
         """
         await self.ensure_group()
+
+        # Guard: Only the current holder should drive dispatch
+        # This prevents double-release from breaking last_key invariants
+        current = await self.r.get(self.last_key)
+        if current is None or current.decode() != msg_id:
+            # Either already advanced or wrong session; just ack best-effort and bail
+            try:
+                await self.r.xack(self.stream, self.group, msg_id)
+            except Exception:
+                pass
+            return
 
         # 1) Ack OUR OWN message (not from last_key!)
         try:

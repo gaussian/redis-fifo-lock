@@ -25,6 +25,7 @@ def mock_async_redis():
     mock.xack = AsyncMock()
     mock.xautoclaim = AsyncMock()
     mock.xreadgroup = AsyncMock()
+    mock.xpending_range = AsyncMock()
     mock.lpush = AsyncMock()
     mock.pexpire = AsyncMock()
     mock.set = AsyncMock()
@@ -279,3 +280,236 @@ class TestAsyncStreamGateSession:
 
         # Verify release was called despite exception
         assert mock_async_redis.xreadgroup.called
+
+
+class TestAsyncStreamGateIssueFixesNormalOperation:
+    """Tests for normal operation with multiple waiters (Issue A verification)."""
+
+    @pytest.mark.asyncio
+    async def test_multiple_waiters_sequential(self, async_stream_gate, mock_async_redis):
+        """Test that multiple waiters are processed in FIFO order."""
+        # First waiter
+        mock_async_redis.xadd.return_value = b"1234567890-0"
+        mock_async_redis.set.return_value = True  # First waiter gets lock
+        mock_async_redis.xreadgroup.return_value = [
+            ("gate:stream", [(b"1234567890-0", {b"owner": b"owner-1"})])
+        ]
+        mock_async_redis.blpop.return_value = (b"gate:sig:owner-1", b"1")
+
+        owner1, msg_id1 = await async_stream_gate.acquire()
+        assert owner1 is not None
+        assert msg_id1 == b"1234567890-0"
+
+        # Release first waiter and dispatch second
+        mock_async_redis.get.return_value = b"1234567890-0"  # last_key matches
+        mock_async_redis.xautoclaim.return_value = ("0-0", [])
+        mock_async_redis.xreadgroup.return_value = [
+            ("gate:stream", [(b"1234567891-0", {b"owner": b"owner-2"})])
+        ]
+
+        await async_stream_gate.release(owner1, msg_id1)
+
+        # Verify second waiter was signaled
+        assert mock_async_redis.lpush.called
+        lpush_calls = [call[0][0] for call in mock_async_redis.lpush.call_args_list]
+        assert any("owner-2" in str(call) for call in lpush_calls)
+
+
+class TestAsyncStreamGateIssueFixesWaiterDrivenRecovery:
+    """Tests for waiter-driven crash recovery (Issue A fix)."""
+
+    @pytest.mark.asyncio
+    async def test_waiter_driven_recovery_on_timeout(
+        self, async_stream_gate, mock_async_redis
+    ):
+        """Test that waiters call recovery logic when BLPOP times out."""
+        mock_async_redis.xadd.return_value = b"1234567890-0"
+        mock_async_redis.set.return_value = False  # Not first waiter
+        mock_async_redis.xautoclaim.return_value = ("0-0", [])
+        mock_async_redis.xreadgroup.return_value = []
+
+        # Simulate BLPOP timeout twice, then signal
+        mock_async_redis.blpop.side_effect = [
+            None,  # First timeout (5s)
+            None,  # Second timeout (5s)
+            (b"gate:sig:test-owner", b"1"),  # Finally signaled
+        ]
+
+        owner, msg_id = await async_stream_gate.acquire()
+
+        # Verify BLPOP was called multiple times (internal timeout loop)
+        assert mock_async_redis.blpop.call_count == 3
+
+        # Verify recovery was attempted on timeouts
+        assert mock_async_redis.xautoclaim.call_count >= 2
+
+    @pytest.mark.asyncio
+    async def test_waiter_detects_dead_leader(self, async_stream_gate, mock_async_redis):
+        """Test that waiting process can detect and advance past dead leader."""
+        mock_async_redis.xadd.return_value = b"1234567890-0"
+        mock_async_redis.set.return_value = False  # Not first waiter
+
+        # First timeout: XAUTOCLAIM finds stuck entry (< 2 min idle)
+        mock_async_redis.xpending_range.return_value = [
+            {"time_since_delivered": 90000}  # 90 seconds, < 2 minutes
+        ]
+        mock_async_redis.xautoclaim.return_value = (
+            "0-0",
+            [(b"stuck-id", {b"owner": b"stuck-owner"})],
+        )
+
+        # Second timeout: no stuck entry, read new message
+        mock_async_redis.blpop.side_effect = [
+            None,  # Timeout, triggers recovery
+            (b"gate:sig:test-owner", b"1"),  # Gets signaled
+        ]
+
+        owner, msg_id = await async_stream_gate.acquire()
+
+        # Verify recovery logic was called
+        assert mock_async_redis.xautoclaim.called
+        assert mock_async_redis.xpending_range.called
+
+
+class TestAsyncStreamGateIssueFixesDeadHolderTimeout:
+    """Tests for dead holder timeout (Issue B fix)."""
+
+    @pytest.mark.asyncio
+    async def test_dead_holder_timeout_skips_entry(
+        self, async_stream_gate, mock_async_redis
+    ):
+        """Test that entries idle >= 2 minutes are XACKed and skipped."""
+        mock_async_redis.get.return_value = b"previous-msg-id"
+
+        # XAUTOCLAIM finds an entry idle for 2+ minutes
+        mock_async_redis.xautoclaim.return_value = (
+            "0-0",
+            [(b"dead-holder-msg-id", {b"owner": b"dead-owner"})],
+        )
+
+        # XPENDING_RANGE shows it's been idle for 2+ minutes
+        mock_async_redis.xpending_range.return_value = [
+            {"time_since_delivered": 150000}  # 150 seconds = 2.5 minutes
+        ]
+
+        # After XACKing dead holder, XREADGROUP returns next waiter
+        mock_async_redis.xreadgroup.return_value = [
+            ("gate:stream", [(b"next-msg-id", {b"owner": b"next-owner"})])
+        ]
+
+        # Call _recover_and_maybe_dispatch
+        result = await async_stream_gate._recover_and_maybe_dispatch()
+
+        # Verify dead holder was XACKed
+        xack_calls = mock_async_redis.xack.call_args_list
+        assert any(
+            b"dead-holder-msg-id" in str(call) or "dead-holder-msg-id" in str(call)
+            for call in xack_calls
+        )
+
+        # Verify next waiter was dispatched
+        assert result is True
+        assert mock_async_redis.lpush.called
+
+    @pytest.mark.asyncio
+    async def test_idle_holder_still_processing(
+        self, async_stream_gate, mock_async_redis
+    ):
+        """Test that entries idle < 2 minutes are re-signaled (still processing)."""
+        mock_async_redis.get.return_value = b"previous-msg-id"
+
+        # XAUTOCLAIM finds an idle entry
+        mock_async_redis.xautoclaim.return_value = (
+            "0-0",
+            [(b"slow-holder-msg-id", {b"owner": b"slow-owner"})],
+        )
+
+        # XPENDING_RANGE shows it's only been idle for 90 seconds (< 2 minutes)
+        mock_async_redis.xpending_range.return_value = [
+            {"time_since_delivered": 90000}  # 90 seconds
+        ]
+
+        result = await async_stream_gate._recover_and_maybe_dispatch()
+
+        # Verify slow holder was re-signaled (not skipped)
+        assert result is True
+        lpush_calls = [call[0][0] for call in mock_async_redis.lpush.call_args_list]
+        assert any("slow-owner" in str(call) for call in lpush_calls)
+
+        # Verify it was NOT XACKed (should keep processing)
+        xack_calls = mock_async_redis.xack.call_args_list
+        # Should not contain the slow holder's msg_id
+        assert not any(
+            "slow-holder-msg-id" in str(call) for call in xack_calls
+        ), "Slow holder should not be XACKed"
+
+
+class TestAsyncStreamGateIssueFixesDoubleReleaseProtection:
+    """Tests for double-release protection (Issue C fix)."""
+
+    @pytest.mark.asyncio
+    async def test_double_release_prevented(self, async_stream_gate, mock_async_redis):
+        """Test that double release does not break last_key."""
+        msg_id = "1234567890-0"
+        owner = "test-owner"
+
+        # First release: last_key matches
+        mock_async_redis.get.return_value = msg_id.encode()
+        mock_async_redis.xautoclaim.return_value = ("0-0", [])
+        mock_async_redis.xreadgroup.return_value = [
+            ("gate:stream", [(b"next-msg-id", {b"owner": b"next-owner"})])
+        ]
+
+        await async_stream_gate.release(owner, msg_id)
+
+        # Verify first release worked
+        first_release_xack_count = mock_async_redis.xack.call_count
+        first_release_lpush_count = mock_async_redis.lpush.call_count
+
+        # Second release: last_key no longer matches (already advanced)
+        mock_async_redis.get.return_value = b"next-msg-id"  # Different!
+
+        await async_stream_gate.release(owner, msg_id)
+
+        # Verify second release did XACK (best-effort)
+        assert mock_async_redis.xack.call_count > first_release_xack_count
+
+        # Verify second release did NOT dispatch (no lpush)
+        assert (
+            mock_async_redis.lpush.call_count == first_release_lpush_count
+        ), "Second release should not dispatch"
+
+    @pytest.mark.asyncio
+    async def test_wrong_session_release_prevented(
+        self, async_stream_gate, mock_async_redis
+    ):
+        """Test that release from wrong session doesn't dispatch."""
+        # Current holder is "msg-1"
+        mock_async_redis.get.return_value = b"msg-1"
+
+        # Someone tries to release "msg-0" (wrong session)
+        await async_stream_gate.release("old-owner", "msg-0")
+
+        # Verify XACK was attempted (best-effort cleanup)
+        assert mock_async_redis.xack.called
+
+        # Verify NO dispatch occurred (no xautoclaim, no xreadgroup)
+        assert not mock_async_redis.xautoclaim.called
+        assert not mock_async_redis.xreadgroup.called
+
+    @pytest.mark.asyncio
+    async def test_release_after_last_key_cleared(
+        self, async_stream_gate, mock_async_redis
+    ):
+        """Test that release after last_key cleared doesn't break anything."""
+        # last_key is None (queue empty)
+        mock_async_redis.get.return_value = None
+
+        await async_stream_gate.release("owner", "msg-id")
+
+        # Verify XACK was attempted (best-effort)
+        assert mock_async_redis.xack.called
+
+        # Verify NO dispatch occurred
+        assert not mock_async_redis.xautoclaim.called
+        assert not mock_async_redis.xreadgroup.called
