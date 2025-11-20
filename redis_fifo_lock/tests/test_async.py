@@ -82,7 +82,7 @@ class TestAsyncStreamGateEnsureGroup:
         """Test that ensure_group creates the consumer group."""
         await async_stream_gate.ensure_group()
         mock_async_redis.xgroup_create.assert_called_once_with(
-            "gate:stream", "gate:group", id="$", mkstream=True
+            "gate:stream", "gate:group", id="0", mkstream=True
         )
 
     @pytest.mark.asyncio
@@ -141,9 +141,10 @@ class TestAsyncStreamGateAcquire:
 
         await async_stream_gate.acquire(timeout=30)
 
-        # Verify blpop was called with timeout
+        # Verify blpop was called with internal timeout (5s max, or remaining time)
         call_args = mock_async_redis.blpop.call_args
-        assert call_args[1]["timeout"] == 30
+        # Internal timeout is min(5, remaining_time), so should be 5 on first call
+        assert call_args[1]["timeout"] == 5
 
     @pytest.mark.asyncio
     async def test_acquire_timeout_reached(self, async_stream_gate, mock_async_redis):
@@ -174,9 +175,11 @@ class TestAsyncStreamGateRelease:
             )
         ]
 
-        await async_stream_gate.release("owner", "msg_id")
+        await async_stream_gate.release("owner", "1234567890-0")
+        # Give event loop a chance to run the background dispatch task
+        await asyncio.sleep(0)
 
-        # Verify previous message was acked (note: last.decode() converts bytes to str)
+        # Verify previous message was acked
         mock_async_redis.xack.assert_called_once_with(
             "gate:stream", "gate:group", "1234567890-0"
         )
@@ -189,11 +192,13 @@ class TestAsyncStreamGateRelease:
     @pytest.mark.asyncio
     async def test_release_empty_queue(self, async_stream_gate, mock_async_redis):
         """Test release when queue is empty."""
-        mock_async_redis.get.return_value = None
+        mock_async_redis.get.return_value = b"msg_id"  # last_key matches msg_id
         mock_async_redis.xautoclaim.return_value = ("0-0", [])
         mock_async_redis.xreadgroup.return_value = []
 
         await async_stream_gate.release("owner", "msg_id")
+        # Give event loop a chance to run the background dispatch task
+        await asyncio.sleep(0)
 
         # Verify last key was deleted
         mock_async_redis.delete.assert_called_with("gate:last-dispatched")
@@ -201,13 +206,18 @@ class TestAsyncStreamGateRelease:
     @pytest.mark.asyncio
     async def test_release_with_crash_recovery(self, async_stream_gate, mock_async_redis):
         """Test release performs crash recovery."""
-        mock_async_redis.get.return_value = None
+        mock_async_redis.get.return_value = b"msg_id"  # last_key matches msg_id
+        mock_async_redis.xpending_range.return_value = [
+            {"time_since_delivered": 90000}  # 90 seconds, < 2 minutes
+        ]
         mock_async_redis.xautoclaim.return_value = (
             "0-0",
             [(b"stuck-id", {b"owner": b"stuck-owner"})],
         )
 
         await async_stream_gate.release("owner", "msg_id")
+        # Give event loop a chance to run the background dispatch task
+        await asyncio.sleep(0)
 
         # Verify stuck entry was re-signaled
         lpush_call = mock_async_redis.lpush.call_args
@@ -237,10 +247,13 @@ class TestAsyncStreamGateSession:
     async def test_session_success(self, async_stream_gate, mock_async_redis):
         """Test session context manager acquire and release."""
         mock_async_redis.xadd.return_value = b"1234567890-0"
+        mock_async_redis.set.return_value = True  # First waiter gets lock
+        mock_async_redis.xreadgroup.return_value = [
+            ("gate:stream", [(b"1234567890-0", {b"owner": b"test-owner"})])
+        ]
         mock_async_redis.blpop.return_value = (b"gate:sig:test-uuid", b"1")
-        mock_async_redis.get.return_value = None
+        mock_async_redis.get.return_value = b"1234567890-0"  # For release
         mock_async_redis.xautoclaim.return_value = ("0-0", [])
-        mock_async_redis.xreadgroup.return_value = []
 
         async with await async_stream_gate.session() as session:
             assert session.owner is not None
@@ -253,26 +266,32 @@ class TestAsyncStreamGateSession:
     async def test_session_with_timeout(self, async_stream_gate, mock_async_redis):
         """Test session context manager with timeout."""
         mock_async_redis.xadd.return_value = b"1234567890-0"
+        mock_async_redis.set.return_value = True  # First waiter gets lock
+        mock_async_redis.xreadgroup.return_value = [
+            ("gate:stream", [(b"1234567890-0", {b"owner": b"test-owner"})])
+        ]
         mock_async_redis.blpop.return_value = (b"gate:sig:test-uuid", b"1")
-        mock_async_redis.get.return_value = None
+        mock_async_redis.get.return_value = b"1234567890-0"  # For release
         mock_async_redis.xautoclaim.return_value = ("0-0", [])
-        mock_async_redis.xreadgroup.return_value = []
 
         async with await async_stream_gate.session(timeout=30):
             pass
 
-        # Verify acquire was called with timeout
+        # Verify acquire was called with internal timeout (5s)
         call_args = mock_async_redis.blpop.call_args
-        assert call_args[1]["timeout"] == 30
+        assert call_args[1]["timeout"] == 5
 
     @pytest.mark.asyncio
     async def test_session_with_exception(self, async_stream_gate, mock_async_redis):
         """Test session context manager releases even on exception."""
         mock_async_redis.xadd.return_value = b"1234567890-0"
+        mock_async_redis.set.return_value = True  # First waiter gets lock
+        mock_async_redis.xreadgroup.return_value = [
+            ("gate:stream", [(b"1234567890-0", {b"owner": b"test-owner"})])
+        ]
         mock_async_redis.blpop.return_value = (b"gate:sig:test-uuid", b"1")
-        mock_async_redis.get.return_value = None
+        mock_async_redis.get.return_value = b"1234567890-0"  # For release
         mock_async_redis.xautoclaim.return_value = ("0-0", [])
-        mock_async_redis.xreadgroup.return_value = []
 
         with pytest.raises(ValueError):
             async with await async_stream_gate.session():
@@ -302,17 +321,22 @@ class TestAsyncStreamGateIssueFixesNormalOperation:
 
         # Release first waiter and dispatch second
         mock_async_redis.get.return_value = b"1234567890-0"  # last_key matches
+        mock_async_redis.xpending_range.return_value = []  # No pending entries
         mock_async_redis.xautoclaim.return_value = ("0-0", [])
         mock_async_redis.xreadgroup.return_value = [
             ("gate:stream", [(b"1234567891-0", {b"owner": b"owner-2"})])
         ]
 
-        await async_stream_gate.release(owner1, msg_id1)
+        # Decode msg_id1 to string for release (msg_id parameter expects string)
+        await async_stream_gate.release(owner1, msg_id1.decode() if isinstance(msg_id1, bytes) else msg_id1)
+        # Give event loop a chance to run the background dispatch task
+        await asyncio.sleep(0)
 
         # Verify second waiter was signaled
         assert mock_async_redis.lpush.called
         lpush_calls = [call[0][0] for call in mock_async_redis.lpush.call_args_list]
-        assert any("owner-2" in str(call) for call in lpush_calls)
+        # Check if owner-2 was signaled (should be second lpush call after first waiter's self-signal)
+        assert any("owner-2" in str(call) for call in lpush_calls), f"Expected 'owner-2' in lpush calls: {lpush_calls}"
 
 
 class TestAsyncStreamGateIssueFixesWaiterDrivenRecovery:
@@ -403,7 +427,7 @@ class TestAsyncStreamGateIssueFixesDeadHolderTimeout:
         # Verify dead holder was XACKed
         xack_calls = mock_async_redis.xack.call_args_list
         assert any(
-            b"dead-holder-msg-id" in str(call) or "dead-holder-msg-id" in str(call)
+            "dead-holder-msg-id" in str(call)
             for call in xack_calls
         )
 
