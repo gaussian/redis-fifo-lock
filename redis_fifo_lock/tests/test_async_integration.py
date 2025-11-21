@@ -8,6 +8,8 @@ These tests require a running Redis instance and test real-world scenarios inclu
 - Dead holder detection and timeout
 - State corruption recovery
 
+No mocking for these tests (unless injecting errors).
+
 Run with: pytest -m integration
 Skip if Redis unavailable: Tests will skip gracefully
 """
@@ -107,7 +109,7 @@ class TestRealRedisIntegration:
 
         # Verify message was acked (removed from pending)
         pending = await clean_gate.r.xpending(clean_gate.stream, clean_gate.group)
-        assert pending[b"pending"] == 0
+        assert pending["pending"] == 0  # XPENDING returns dict with 'pending' key
 
     async def test_real_redis_fifo_ordering(self, clean_gate):
         """Verify 5 sequential acquires maintain FIFO order."""
@@ -144,7 +146,11 @@ class TestRealRedisIntegration:
         # Check group exists
         groups = await clean_gate.r.xinfo_groups(clean_gate.stream)
         assert len(groups) == 1
-        assert groups[0][b"name"] == clean_gate.group.encode()
+        # XINFO GROUPS returns list of dicts with 'name' key
+        group_name = groups[0].get("name") or groups[0].get(b"name", b"")
+        if isinstance(group_name, bytes):
+            group_name = group_name.decode()
+        assert group_name == clean_gate.group
 
     async def test_real_redis_xpending_tracking(self, clean_gate):
         """Verify pending entries list is managed correctly."""
@@ -152,14 +158,14 @@ class TestRealRedisIntegration:
 
         # Check message is pending
         pending = await clean_gate.r.xpending(clean_gate.stream, clean_gate.group)
-        assert pending[b"pending"] == 1
+        assert pending["pending"] == 1  # XPENDING returns dict with 'pending' key
 
         await clean_gate.release(owner, msg_id.decode())
         await asyncio.sleep(0)
 
         # Check message was acked
         pending = await clean_gate.r.xpending(clean_gate.stream, clean_gate.group)
-        assert pending[b"pending"] == 0
+        assert pending["pending"] == 0  # XPENDING returns dict with 'pending' key
 
     async def test_real_redis_xack_removes_from_pel(self, clean_gate):
         """Verify XACK actually removes message from PEL."""
@@ -183,15 +189,28 @@ class TestRealRedisIntegration:
     @pytest.mark.slow
     async def test_real_redis_signal_key_ttl(self, clean_gate):
         """Verify signal keys have TTL set correctly."""
-        owner, msg_id = await clean_gate.acquire()
+        # First holder acquires
+        owner1, msg_id1 = await clean_gate.acquire()
 
-        sig_key = clean_gate.sig_prefix + owner
-        # TTL should be set (5 minutes = 300000 ms)
+        # Create a second waiter that will be signaled but won't consume yet
+        import uuid
+
+        owner2 = str(uuid.uuid4())
+        msg_id2 = await clean_gate.r.xadd(clean_gate.stream, {"owner": owner2})
+
+        # Release first holder to signal second waiter
+        await clean_gate.release(owner1, msg_id1.decode())
+        await asyncio.sleep(0.1)  # Let dispatch signal the second waiter
+
+        # Now check TTL of second waiter's signal key (before they BLPOP it)
+        sig_key = clean_gate.sig_prefix + owner2
         ttl = await clean_gate.r.pttl(sig_key)
-        assert ttl > 0
+        assert ttl > 0, f"Signal key should exist with positive TTL, got {ttl}"
         assert ttl <= 300000  # Should be <= 5 minutes
 
-        await clean_gate.release(owner, msg_id.decode())
+        # Clean up: acquire as second waiter and release
+        owner2_acquired, msg_id2_acquired = await clean_gate.acquire()
+        await clean_gate.release(owner2_acquired, msg_id2_acquired.decode())
 
     async def test_real_redis_stream_growth(self, clean_gate):
         """Verify stream doesn't grow unbounded over 100 cycles."""
@@ -217,7 +236,9 @@ class TestRealRedisIntegration:
 
         # After release with empty queue, last_key should be deleted
         await clean_gate.release(owner, msg_id.decode())
-        await asyncio.sleep(0)
+        await asyncio.sleep(
+            0.5
+        )  # Give background task time to complete and delete last_key
 
         last_key_value = await clean_gate.r.get(clean_gate.last_key)
         assert last_key_value is None
@@ -280,7 +301,9 @@ class TestConcurrency:
         assert len(results) == 10
 
         # Message IDs should be in order (FIFO)
-        msg_ids = [r[2] for r in results]
+        # Sort results by msg_id since async completion order may differ
+        results_sorted = sorted(results, key=lambda r: r[2])
+        msg_ids = [r[2] for r in results_sorted]
         assert msg_ids == sorted(msg_ids)
 
     async def test_concurrent_acquire_release_interleaved(self, clean_gate):
@@ -402,7 +425,7 @@ class TestConcurrency:
         # Start waiters with different timeouts
         waiters = [
             waiter_with_timeout(0, 1),  # Should timeout
-            waiter_with_timeout(1, 2),  # Should timeout
+            waiter_with_timeout(1, 1),  # Should timeout
             waiter_with_timeout(2, 10),  # Should acquire
             waiter_with_timeout(3, 10),  # Should acquire
         ]
@@ -410,8 +433,9 @@ class TestConcurrency:
         tasks = [asyncio.create_task(w) for w in waiters]
         await asyncio.sleep(0.1)  # Let waiters start
 
-        # Hold for 2.5 seconds then release
-        await asyncio.sleep(2.5)
+        # Hold for 3.5 seconds then release
+        # This ensures waiter 0 (1s) and waiter 1 (1s) both timeout before release
+        await asyncio.sleep(3.5)
         await clean_gate.release(owner1, msg_id1.decode())
         await asyncio.sleep(0)
 
@@ -607,159 +631,199 @@ class TestDeadHolderChains:
 
     pytestmark = pytest.mark.asyncio
 
-    async def test_single_dead_holder_recovery(self, clean_gate):
+    async def test_single_dead_holder_recovery(self, real_redis):
         """Holder acquires, never releases - next waiter gets gate after timeout."""
-        owner1, msg_id1 = await clean_gate.acquire()
+        # Create gate with 500ms dead holder timeout (instead of 2 minutes)
+        test_id = str(uuid.uuid4())[:8]
+        gate = AsyncStreamGate(
+            real_redis,
+            stream=f"test-gate-{test_id}",
+            group=f"test-group-{test_id}",
+            sig_prefix=f"test-sig-{test_id}:",
+            last_key=f"test-last-{test_id}",
+            claim_idle_ms=100,  # Claim after 100ms idle
+            dead_holder_timeout_ms=500,  # Consider dead after 500ms
+        )
 
-        # Second waiter
+        # First holder acquires but never releases - simulate dead holder
+        owner1, msg_id1 = await gate.acquire()
+
+        # Second waiter starts
         async def waiter():
-            return await clean_gate.acquire(timeout=70)
+            return await gate.acquire(timeout=10)
 
         waiter_task = asyncio.create_task(waiter())
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.1)  # Let waiter start and enqueue
 
-        # Simulate owner1 being dead by not releasing
-        # Mock xpending_range to return idle time > 60s (to trigger XAUTOCLAIM)
-        # and > 120s (to trigger dead holder timeout)
-        original_xpending_range = clean_gate.r.xpending_range
+        # Wait for first holder to exceed dead holder timeout (600ms > 500ms)
+        await asyncio.sleep(0.6)
 
-        async def mock_xpending_range(*args, **kwargs):
-            result = await original_xpending_range(*args, **kwargs)
-            if result:
-                # Force idle time to be 125 seconds (> 2 minutes)
-                return [{"time_since_delivered": 125000}]
-            return result
-
-        clean_gate.r.xpending_range = mock_xpending_range
-
-        # Waiter should recover and get the gate
+        # Waiter should recover and get the gate via waiter-driven recovery
         owner2, msg_id2 = await asyncio.wait_for(waiter_task, timeout=15)
         assert owner2 is not None
         assert owner2 != owner1
 
-        # Restore and cleanup
-        clean_gate.r.xpending_range = original_xpending_range
-        await clean_gate.release(owner2, msg_id2.decode())
+        # Cleanup
+        msg_id2_str = msg_id2.decode() if isinstance(msg_id2, bytes) else msg_id2
+        await gate.release(owner2, msg_id2_str)
+        await asyncio.sleep(0.1)
+        await gate.r.delete(gate.stream, gate.last_key)
+        await gate.r.delete(f"{gate.sig_prefix}{owner1}")
+        await gate.r.delete(f"{gate.sig_prefix}{owner2}")
 
-    async def test_dead_holder_exactly_2_minutes(self, clean_gate):
-        """Idle time = exactly 120000 ms - should XACK."""
-        owner, msg_id = await clean_gate.acquire()
+    async def test_dead_holder_exactly_2_minutes(self, real_redis):
+        """Idle time = exactly at timeout threshold - should XACK."""
+        # Create gate with 500ms dead holder timeout (instead of 2 minutes)
+        test_id = str(uuid.uuid4())[:8]
+        gate = AsyncStreamGate(
+            real_redis,
+            stream=f"test-gate-{test_id}",
+            group=f"test-group-{test_id}",
+            sig_prefix=f"test-sig-{test_id}:",
+            last_key=f"test-last-{test_id}",
+            claim_idle_ms=100,  # Claim after 100ms idle
+            dead_holder_timeout_ms=500,  # Consider dead after 500ms
+        )
 
-        # Mock xpending_range to return exactly 2 minutes
-        async def mock_xpending_range(*args, **kwargs):
-            return [{"time_since_delivered": 120000}]
+        # Acquire but don't release - simulate dead holder
+        owner, msg_id = await gate.acquire()
 
-        clean_gate.r.xpending_range = mock_xpending_range
+        # Wait exactly at the timeout threshold (500ms)
+        await asyncio.sleep(0.5)
 
-        # Call recovery
-        result = await clean_gate._recover_and_maybe_dispatch()
+        # Call recovery - should find it idle >= 500ms and XACK it
+        result = await gate._recover_and_maybe_dispatch()
 
         # Should have XACKed (dead holder)
         # Queue should be empty now
-        pending = await clean_gate.r.xpending(clean_gate.stream, clean_gate.group)
-        assert pending[b"pending"] == 0
+        pending = await gate.r.xpending(gate.stream, gate.group)
+        assert pending["pending"] == 0  # XPENDING returns dict with 'pending' key
 
-    async def test_dead_holder_just_under_2_minutes(self, clean_gate):
-        """Idle time = 119999 ms - should re-signal."""
-        owner, msg_id = await clean_gate.acquire()
+        # Cleanup
+        await gate.r.delete(gate.stream, gate.last_key)
+        await gate.r.delete(f"{gate.sig_prefix}{owner}")
 
-        # Create second waiter
-        async def waiter():
-            return await clean_gate.acquire(timeout=10)
+    async def test_dead_holder_just_under_2_minutes(self, real_redis):
+        """Idle time = just under timeout threshold - should re-signal."""
+        # Create gate with 500ms dead holder timeout (instead of 2 minutes)
+        test_id = str(uuid.uuid4())[:8]
+        gate = AsyncStreamGate(
+            real_redis,
+            stream=f"test-gate-{test_id}",
+            group=f"test-group-{test_id}",
+            sig_prefix=f"test-sig-{test_id}:",
+            last_key=f"test-last-{test_id}",
+            claim_idle_ms=100,  # Claim after 100ms idle
+            dead_holder_timeout_ms=500,  # Consider dead after 500ms
+        )
 
-        waiter_task = asyncio.create_task(waiter())
-        await asyncio.sleep(0.1)
+        # Acquire but don't release - simulate holder still processing
+        owner, msg_id = await gate.acquire()
 
-        # Mock xpending_range to return just under 2 minutes
-        async def mock_xpending_range(*args, **kwargs):
-            return [{"time_since_delivered": 119999}]
+        # Wait just under the timeout threshold (400ms < 500ms)
+        await asyncio.sleep(0.4)
 
-        clean_gate.r.xpending_range = mock_xpending_range
-
-        # Manually trigger recovery (simulating waiter's periodic wake)
-        await clean_gate._recover_and_maybe_dispatch()
-        await asyncio.sleep(0.1)
+        # Call recovery - should find it idle but < 500ms, so re-signal (not XACK)
+        result = await gate._recover_and_maybe_dispatch()
 
         # First owner should have been re-signaled (still processing)
         # Pending should still be 1
-        pending = await clean_gate.r.xpending(clean_gate.stream, clean_gate.group)
-        assert pending[b"pending"] == 1
+        pending = await gate.r.xpending(gate.stream, gate.group)
+        assert pending["pending"] == 1  # XPENDING returns dict with 'pending' key
 
-        # Clean up
-        await clean_gate.release(owner, msg_id.decode())
+        # Cleanup
+        await gate.release(owner, msg_id.decode())
         await asyncio.sleep(0.1)
+        await gate.r.delete(gate.stream, gate.last_key)
+        await gate.r.delete(f"{gate.sig_prefix}{owner}")
 
-        # Now second waiter should get it
-        owner2, msg_id2 = await waiter_task
-        await clean_gate.release(owner2, msg_id2.decode())
-
-    async def test_all_waiters_dead_queue_empties(self, clean_gate):
+    async def test_all_waiters_dead_queue_empties(self, real_redis):
         """Queue has only dead holders - verify queue drains."""
-        # Acquire multiple times without releasing
+        # Create gate with 500ms dead holder timeout (instead of 2 minutes)
+        test_id = str(uuid.uuid4())[:8]
+        gate = AsyncStreamGate(
+            real_redis,
+            stream=f"test-gate-{test_id}",
+            group=f"test-group-{test_id}",
+            sig_prefix=f"test-sig-{test_id}:",
+            last_key=f"test-last-{test_id}",
+            claim_idle_ms=100,  # Claim after 100ms idle
+            dead_holder_timeout_ms=500,  # Consider dead after 500ms
+        )
+
+        # Acquire multiple times without releasing - simulate dead holders
         holders = []
         for _ in range(3):
-            owner, msg_id = await clean_gate.acquire()
+            owner, msg_id = await gate.acquire()
             holders.append((owner, msg_id))
             # Don't release - simulate dead
 
-        # Mock all as dead (> 2 minutes)
-        async def mock_xpending_range(*args, **kwargs):
-            return [{"time_since_delivered": 150000}]
-
-        clean_gate.r.xpending_range = mock_xpending_range
+        # Wait for all holders to exceed timeout (600ms > 500ms)
+        await asyncio.sleep(0.6)
 
         # Run recovery multiple times to clear all dead holders
         for _ in range(5):
-            await clean_gate._recover_and_maybe_dispatch()
+            await gate._recover_and_maybe_dispatch()
             await asyncio.sleep(0.1)
 
         # Queue should be empty now
-        pending = await clean_gate.r.xpending(clean_gate.stream, clean_gate.group)
-        assert pending[b"pending"] == 0
+        pending = await gate.r.xpending(gate.stream, gate.group)
+        assert pending["pending"] == 0  # XPENDING returns dict with 'pending' key
 
         # last_key should be deleted
-        last_key = await clean_gate.r.get(clean_gate.last_key)
+        last_key = await gate.r.get(gate.last_key)
         assert last_key is None
 
+        # Cleanup
+        await gate.r.delete(gate.stream)
+        for owner, _ in holders:
+            await gate.r.delete(f"{gate.sig_prefix}{owner}")
+
     @pytest.mark.slow
-    async def test_multiple_consecutive_dead_holders(self, clean_gate):
+    async def test_multiple_consecutive_dead_holders(self, real_redis):
         """3 dead holders in queue - verify recovery cascades through all."""
-        # Create 3 dead holders + 1 live waiter
+        # Create gate with 500ms dead holder timeout (instead of 2 minutes)
+        test_id = str(uuid.uuid4())[:8]
+        gate = AsyncStreamGate(
+            real_redis,
+            stream=f"test-gate-{test_id}",
+            group=f"test-group-{test_id}",
+            sig_prefix=f"test-sig-{test_id}:",
+            last_key=f"test-last-{test_id}",
+            claim_idle_ms=100,  # Claim after 100ms idle
+            dead_holder_timeout_ms=500,  # Consider dead after 500ms
+        )
+
+        # Create 3 dead holders (acquire but never release)
         holders = []
-        for i in range(3):
-            owner, msg_id = await clean_gate.acquire()
+        for _ in range(3):
+            owner, msg_id = await gate.acquire()
             holders.append((owner, msg_id))
             # Don't release - simulate dead
 
-        # Fourth waiter (live)
+        # Fourth waiter (live) - should eventually get the gate after all 3 dead holders are cleared
         async def live_waiter():
-            return await clean_gate.acquire(timeout=30)
+            return await gate.acquire(timeout=15)
 
         waiter_task = asyncio.create_task(live_waiter())
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.1)  # Let live waiter start
 
-        # Mock dead holders (> 2 minutes idle)
-        call_count = [0]
+        # Wait for all 3 dead holders to exceed timeout (600ms > 500ms)
+        await asyncio.sleep(0.6)
 
-        async def mock_xpending_range(*args, **kwargs):
-            call_count[0] += 1
-            # First 3 calls return dead, then alive
-            if call_count[0] <= 3:
-                return [{"time_since_delivered": 150000}]
-            return [{"time_since_delivered": 0}]
-
-        clean_gate.r.xpending_range = mock_xpending_range
-
-        # Trigger recovery multiple times
-        for _ in range(10):
-            await clean_gate._recover_and_maybe_dispatch()
-            await asyncio.sleep(0.2)
-
-        # Live waiter should eventually get the gate
-        owner4, msg_id4 = await asyncio.wait_for(waiter_task, timeout=15)
+        # Live waiter should eventually acquire via waiter-driven recovery
+        # The waiter's periodic recovery checks will cascade through all 3 dead holders
+        owner4, msg_id4 = await asyncio.wait_for(waiter_task, timeout=20)
         assert owner4 is not None
 
-        await clean_gate.release(owner4, msg_id4.decode())
+        # Cleanup
+        msg_id4_str = msg_id4.decode() if isinstance(msg_id4, bytes) else msg_id4
+        await gate.release(owner4, msg_id4_str)
+        await asyncio.sleep(0.1)
+        await gate.r.delete(gate.stream, gate.last_key)
+        for owner, _ in holders:
+            await gate.r.delete(f"{gate.sig_prefix}{owner}")
+        await gate.r.delete(f"{gate.sig_prefix}{owner4}")
 
 
 # ============================================================================

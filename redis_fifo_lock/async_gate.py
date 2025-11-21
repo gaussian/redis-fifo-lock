@@ -39,6 +39,7 @@ class AsyncStreamGate:
         sig_ttl_ms: int = DEFAULT_SIG_TTL_MS,
         claim_idle_ms: int = DEFAULT_CLAIM_IDLE_MS,
         last_key: str = DEFAULT_LAST_KEY,
+        dead_holder_timeout_ms: int = 120_000,
     ):
         """
         Initialize AsyncStreamGate.
@@ -52,6 +53,7 @@ class AsyncStreamGate:
             sig_ttl_ms: TTL for signal keys in milliseconds
             claim_idle_ms: Idle time before considering a holder dead
             last_key: Key to store the last dispatched message ID
+            dead_holder_timeout_ms: Idle time (ms) before considering holder truly dead (default 2 minutes)
         """
         self.r = r
         self.stream = stream
@@ -61,6 +63,7 @@ class AsyncStreamGate:
         self.sig_ttl_ms = sig_ttl_ms
         self.claim_idle_ms = claim_idle_ms
         self.last_key = last_key
+        self.dead_holder_timeout_ms = dead_holder_timeout_ms
 
     async def ensure_group(self) -> None:
         """Create stream + group if missing."""
@@ -125,9 +128,8 @@ class AsyncStreamGate:
             if claimed:
                 msg_id, fields = claimed[0]
 
-                # Check if this entry has been idle for >= 2 minutes (120 seconds = 120000 ms)
+                # Check if this entry has been idle for >= dead_holder_timeout_ms
                 # If so, consider the holder truly dead and XACK to remove from queue
-                DEAD_HOLDER_TIMEOUT_MS = 120_000
 
                 # Get the pending entry info to check idle time
                 try:
@@ -142,7 +144,7 @@ class AsyncStreamGate:
                     if pending_info and len(pending_info) > 0:
                         idle_time_ms = pending_info[0].get("time_since_delivered", 0)
 
-                        if idle_time_ms >= DEAD_HOLDER_TIMEOUT_MS:
+                        if idle_time_ms >= self.dead_holder_timeout_ms:
                             # Dead holder - XACK to remove from queue and advance
                             await self.r.xack(self.stream, self.group, msg_id)
                             # Don't dispatch this one, fall through to read next message
