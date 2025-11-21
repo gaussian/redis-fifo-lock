@@ -86,7 +86,7 @@ async def clean_gate(real_redis):
 # ============================================================================
 
 
-class TestRealRedisIntegration:
+class TestAsyncRealRedisIntegration:
     """Tests that verify AsyncStreamGate works with real Redis."""
 
     pytestmark = pytest.mark.asyncio
@@ -279,7 +279,7 @@ class TestRealRedisIntegration:
 # ============================================================================
 
 
-class TestConcurrency:
+class TestAsyncConcurrency:
     """Tests for concurrent access by multiple coroutines."""
 
     pytestmark = pytest.mark.asyncio
@@ -469,7 +469,7 @@ class TestConcurrency:
 # ============================================================================
 
 
-class TestFailureInjection:
+class TestAsyncFailureInjection:
     """Tests for handling Redis command failures and exceptions."""
 
     pytestmark = pytest.mark.asyncio
@@ -626,7 +626,7 @@ class TestFailureInjection:
 # ============================================================================
 
 
-class TestDeadHolderChains:
+class TestAsyncDeadHolderChains:
     """Tests for detecting and recovering from dead holders."""
 
     pytestmark = pytest.mark.asyncio
@@ -831,7 +831,7 @@ class TestDeadHolderChains:
 # ============================================================================
 
 
-class TestStateCorruptionRecovery:
+class TestAsyncStateCorruptionRecovery:
     """Tests for recovering from corrupted Redis state."""
 
     pytestmark = pytest.mark.asyncio
@@ -1110,7 +1110,7 @@ def _multiprocess_worker_release_only(
 # ============================================================================
 
 
-class TestMultiProcessConcurrency:
+class TestAsyncMultiProcessConcurrency:
     """Tests for multiple separate Python processes competing for the gate."""
 
     pytestmark = pytest.mark.asyncio
@@ -1477,7 +1477,7 @@ class TestMultiProcessConcurrency:
 # ============================================================================
 
 
-class TestNetworkFailures:
+class TestAsyncNetworkFailures:
     """Tests for handling Redis connection failures and network errors."""
 
     pytestmark = pytest.mark.asyncio
