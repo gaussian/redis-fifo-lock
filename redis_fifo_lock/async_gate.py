@@ -115,54 +115,46 @@ class AsyncStreamGate:
         Returns:
             True if a waiter was dispatched, False if queue is empty
         """
-        # Phase 1: Crash recovery - reclaim idle pending entries
+        # Phase 1: Crash recovery - check for dead or idle holders
+        # CRITICAL: Check XPENDING *before* XAUTOCLAIM, because XAUTOCLAIM resets the idle timer
         try:
-            next_start, claimed = await self.r.xautoclaim(
+            # First, check pending entries WITHOUT claiming them
+            pending_info = await self.r.xpending_range(
                 self.stream,
                 self.group,
-                self.adv_consumer,
-                min_idle_time=self.claim_idle_ms,
-                start_id="0-0",
+                min="-",
+                max="+",
                 count=1,
             )
-            if claimed:
-                msg_id, fields = claimed[0]
 
-                # Check if this entry has been idle for >= dead_holder_timeout_ms
-                # If so, consider the holder truly dead and XACK to remove from queue
+            if pending_info and len(pending_info) > 0:
+                entry = pending_info[0]
+                # Keys: "message_id", "consumer", "time_since_delivered", "times_delivered"
+                idle_time_ms = entry.get("time_since_delivered", 0)
+                msg_id = entry.get("message_id")
 
-                # Get the pending entry info to check idle time
-                try:
-                    pending_info = await self.r.xpending_range(
+                # Allow 50ms tolerance for timing/network latency precision
+                if idle_time_ms >= (self.dead_holder_timeout_ms - 50):
+                    # Dead holder - XACK to remove from queue
+                    await self.r.xack(self.stream, self.group, msg_id)
+                    # Don't dispatch this one - fall through to dispatch next message
+
+                elif idle_time_ms >= self.claim_idle_ms:
+                    # Idle but not dead - claim and re-signal the holder
+                    next_start, claimed = await self.r.xautoclaim(
                         self.stream,
                         self.group,
-                        min=msg_id,
-                        max=msg_id,
+                        self.adv_consumer,
+                        min_idle_time=self.claim_idle_ms,
+                        start_id="0-0",
                         count=1,
                     )
-
-                    if pending_info and len(pending_info) > 0:
-                        idle_time_ms = pending_info[0].get("time_since_delivered", 0)
-
-                        if idle_time_ms >= self.dead_holder_timeout_ms:
-                            # Dead holder - XACK to remove from queue and advance
-                            await self.r.xack(self.stream, self.group, msg_id)
-                            # Don't dispatch this one, fall through to read next message
-                        else:
-                            # Still might be processing, re-signal the same owner
-                            dispatched = await self._dispatch_waiter(claimed[0])
-                            if dispatched:
-                                return True
-                    else:
-                        # No pending info, try to dispatch anyway (best-effort)
+                    if claimed:
                         dispatched = await self._dispatch_waiter(claimed[0])
                         if dispatched:
                             return True
-                except Exception:
-                    # If we can't check idle time, try to dispatch (best-effort)
-                    dispatched = await self._dispatch_waiter(claimed[0])
-                    if dispatched:
-                        return True
+                # else: idle < claim_idle_ms, still processing normally, do nothing
+
         except Exception:
             # Recovery is best-effort; proceed to normal dispatch
             pass
@@ -310,7 +302,9 @@ class AsyncStreamGate:
         # Guard: Only the current holder should drive dispatch
         # This prevents double-release from breaking last_key invariants
         current = await self.r.get(self.last_key)
-        if current is None or current.decode() != msg_id:
+        # Handle both decode_responses=True (str) and decode_responses=False (bytes)
+        current_str = current.decode() if isinstance(current, bytes) else current
+        if current is None or current_str != msg_id:
             # Either already advanced or wrong session; just ack best-effort and bail
             try:
                 await self.r.xack(self.stream, self.group, msg_id)

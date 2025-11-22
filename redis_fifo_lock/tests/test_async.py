@@ -167,6 +167,7 @@ class TestAsyncStreamGateRelease:
     async def test_release_with_pending_entry(self, async_stream_gate, mock_async_redis):
         """Test release dispatches the next entry."""
         mock_async_redis.get.return_value = b"1234567890-0"
+        mock_async_redis.xpending_range.return_value = []  # No pending entries
         mock_async_redis.xautoclaim.return_value = ("0-0", [])
         mock_async_redis.xreadgroup.return_value = [
             (
@@ -193,6 +194,7 @@ class TestAsyncStreamGateRelease:
     async def test_release_empty_queue(self, async_stream_gate, mock_async_redis):
         """Test release when queue is empty."""
         mock_async_redis.get.return_value = b"msg_id"  # last_key matches msg_id
+        mock_async_redis.xpending_range.return_value = []  # No pending entries
         mock_async_redis.xautoclaim.return_value = ("0-0", [])
         mock_async_redis.xreadgroup.return_value = []
 
@@ -208,7 +210,12 @@ class TestAsyncStreamGateRelease:
         """Test release performs crash recovery."""
         mock_async_redis.get.return_value = b"msg_id"  # last_key matches msg_id
         mock_async_redis.xpending_range.return_value = [
-            {"time_since_delivered": 90000}  # 90 seconds, < 2 minutes
+            {
+                "message_id": b"stuck-id",
+                "consumer": b"advancer-consumer",
+                "time_since_delivered": 90000,  # 90 seconds, < 2 minutes
+                "times_delivered": 1
+            }
         ]
         mock_async_redis.xautoclaim.return_value = (
             "0-0",
@@ -349,6 +356,8 @@ class TestAsyncStreamGateIssueFixesWaiterDrivenRecovery:
         """Test that waiters call recovery logic when BLPOP times out."""
         mock_async_redis.xadd.return_value = b"1234567890-0"
         mock_async_redis.set.return_value = False  # Not first waiter
+        # XPENDING_RANGE returns empty (no pending entries), so recovery continues to Phase 2
+        mock_async_redis.xpending_range.return_value = []
         mock_async_redis.xautoclaim.return_value = ("0-0", [])
         mock_async_redis.xreadgroup.return_value = []
 
@@ -364,8 +373,8 @@ class TestAsyncStreamGateIssueFixesWaiterDrivenRecovery:
         # Verify BLPOP was called multiple times (internal timeout loop)
         assert mock_async_redis.blpop.call_count == 3
 
-        # Verify recovery was attempted on timeouts
-        assert mock_async_redis.xautoclaim.call_count >= 2
+        # Verify recovery was attempted on timeouts (checks XPENDING_RANGE now)
+        assert mock_async_redis.xpending_range.call_count >= 2
 
     @pytest.mark.asyncio
     async def test_waiter_detects_dead_leader(self, async_stream_gate, mock_async_redis):
@@ -375,7 +384,12 @@ class TestAsyncStreamGateIssueFixesWaiterDrivenRecovery:
 
         # First timeout: XAUTOCLAIM finds stuck entry (< 2 min idle)
         mock_async_redis.xpending_range.return_value = [
-            {"time_since_delivered": 90000}  # 90 seconds, < 2 minutes
+            {
+                "message_id": b"stuck-id",
+                "consumer": b"advancer-consumer",
+                "time_since_delivered": 90000,  # 90 seconds, < 2 minutes
+                "times_delivered": 1
+            }
         ]
         mock_async_redis.xautoclaim.return_value = (
             "0-0",
@@ -413,7 +427,12 @@ class TestAsyncStreamGateIssueFixesDeadHolderTimeout:
 
         # XPENDING_RANGE shows it's been idle for 2+ minutes
         mock_async_redis.xpending_range.return_value = [
-            {"time_since_delivered": 150000}  # 150 seconds = 2.5 minutes
+            {
+                "message_id": b"dead-holder-msg-id",
+                "consumer": b"dead-owner",
+                "time_since_delivered": 150000,  # 150 seconds = 2.5 minutes
+                "times_delivered": 1
+            }
         ]
 
         # After XACKing dead holder, XREADGROUP returns next waiter
@@ -450,7 +469,12 @@ class TestAsyncStreamGateIssueFixesDeadHolderTimeout:
 
         # XPENDING_RANGE shows it's only been idle for 90 seconds (< 2 minutes)
         mock_async_redis.xpending_range.return_value = [
-            {"time_since_delivered": 90000}  # 90 seconds
+            {
+                "message_id": b"slow-holder-msg-id",
+                "consumer": b"advancer-consumer",
+                "time_since_delivered": 90000,  # 90 seconds
+                "times_delivered": 1
+            }
         ]
 
         result = await async_stream_gate._recover_and_maybe_dispatch()
@@ -479,6 +503,7 @@ class TestAsyncStreamGateIssueFixesDoubleReleaseProtection:
 
         # First release: last_key matches
         mock_async_redis.get.return_value = msg_id.encode()
+        mock_async_redis.xpending_range.return_value = []  # No pending entries
         mock_async_redis.xautoclaim.return_value = ("0-0", [])
         mock_async_redis.xreadgroup.return_value = [
             ("gate:stream", [(b"next-msg-id", {b"owner": b"next-owner"})])
