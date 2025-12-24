@@ -318,11 +318,9 @@ class AsyncStreamGate:
         except Exception:
             pass  # already acked or gone
 
-        # Schedule dispatch as background task to ensure release() completes first
-        # Use create_task with name for better debugging, task will complete on its own
-        task = asyncio.create_task(self._dispatch_next_async())
-        # Don't await - let it run in background, but add done callback to handle errors
-        task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
+        # Dispatch next waiter synchronously to ensure it completes before release() returns.
+        # This prevents the dispatch from being cancelled if the caller's event loop closes.
+        await self._dispatch_next_async()
 
     async def cancel(self, owner: str, msg_id: str) -> None:
         """
