@@ -935,6 +935,7 @@ def _multiprocess_worker_acquire_release(
     worker_id: int,
     result_queue: multiprocessing.Queue,
     delay: float = 0.0,
+    acquire_order_key: str = None,
 ):
     """
     Worker function for multiprocess tests - runs in separate process.
@@ -948,6 +949,7 @@ def _multiprocess_worker_acquire_release(
         worker_id: Worker identifier
         result_queue: Queue to send results back to parent
         delay: Optional delay before acquiring (for testing timing)
+        acquire_order_key: Optional Redis key to atomically track acquisition order
     """
 
     async def _worker():
@@ -969,6 +971,11 @@ def _multiprocess_worker_acquire_release(
             owner, msg_id = await gate.acquire(timeout=30)
             acquire_time = time.time()
 
+            # Atomically record acquisition order via Redis INCR
+            acquire_order = None
+            if acquire_order_key:
+                acquire_order = await client.incr(acquire_order_key)
+
             # Simulate some work
             await asyncio.sleep(0.01)
 
@@ -985,6 +992,7 @@ def _multiprocess_worker_acquire_release(
                     "start_time": start_time,
                     "acquire_time": acquire_time,
                     "release_time": release_time,
+                    "acquire_order": acquire_order,
                     "success": True,
                     "error": None,
                 }
@@ -1124,6 +1132,10 @@ class TestAsyncMultiProcessConcurrency:
         if not redis_url.startswith("redis://") and not redis_url.startswith("rediss://"):
             redis_url = f"redis://{redis_url}/15"
 
+        # Create a unique key to track acquisition order atomically
+        acquire_order_key = f"{clean_gate.stream}:test:acquire_order"
+        await clean_gate.r.delete(acquire_order_key)
+
         result_queue = multiprocessing.Queue()
         processes = []
 
@@ -1140,6 +1152,7 @@ class TestAsyncMultiProcessConcurrency:
                     i,
                     result_queue,
                 ),
+                kwargs={"acquire_order_key": acquire_order_key},
             )
             processes.append(p)
             p.start()
@@ -1151,6 +1164,9 @@ class TestAsyncMultiProcessConcurrency:
                 p.terminate()
                 p.join()
 
+        # Cleanup
+        await clean_gate.r.delete(acquire_order_key)
+
         # Collect results
         results = []
         while not result_queue.empty():
@@ -1160,11 +1176,19 @@ class TestAsyncMultiProcessConcurrency:
         assert len(results) == 3
         assert all(r["success"] for r in results), f"Some workers failed: {results}"
 
-        # Verify FIFO ordering - workers should complete in order they acquired
-        results_sorted = sorted(results, key=lambda r: r["acquire_time"])
-        msg_ids = [r["msg_id"] for r in results_sorted]
-        # Message IDs should be in chronological order (Redis timestamp-based)
-        assert msg_ids == sorted(msg_ids), "Processes did not acquire in FIFO order"
+        # Verify FIFO ordering using atomic Redis counter
+        # Sort by msg_id (the stream order assigned by Redis)
+        results_sorted = sorted(results, key=lambda r: r["msg_id"])
+
+        # The acquire_order (from Redis INCR) should match the msg_id order
+        # i.e., the worker with the earliest msg_id should have acquire_order=1
+        for i, result in enumerate(results_sorted):
+            expected_order = i + 1
+            assert result["acquire_order"] == expected_order, (
+                f"FIFO violation: worker {result['worker_id']} with msg_id={result['msg_id']} "
+                f"acquired in position {result['acquire_order']}, expected position {expected_order}. "
+                f"Full results: {results_sorted}"
+            )
 
     async def test_multiprocess_setnx_race(self, clean_gate):
         """5 processes race on SETNX(last_key) - verify only one wins at a time."""
