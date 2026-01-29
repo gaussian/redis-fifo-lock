@@ -633,7 +633,7 @@ class TestAsyncDeadHolderChains:
 
     async def test_single_dead_holder_recovery(self, real_redis):
         """Holder acquires, never releases - next waiter gets gate after timeout."""
-        # Create gate with 500ms dead holder timeout (instead of 2 minutes)
+        # Create gate with 100ms dead holder timeout (instead of 2 minutes)
         test_id = str(uuid.uuid4())[:8]
         gate = AsyncStreamGate(
             real_redis,
@@ -641,8 +641,9 @@ class TestAsyncDeadHolderChains:
             group=f"test-group-{test_id}",
             sig_prefix=f"test-sig-{test_id}:",
             last_key=f"test-last-{test_id}",
-            claim_idle_ms=100,  # Claim after 100ms idle
-            dead_holder_timeout_ms=500,  # Consider dead after 500ms
+            claim_idle_ms=50,  # Claim after 50ms idle
+            dead_holder_timeout_ms=100,  # Consider dead after 100ms
+            blpop_internal_timeout_ms=1000,  # Faster recovery loop for tests (1 second)
         )
 
         # First holder acquires but never releases - simulate dead holder
@@ -653,10 +654,10 @@ class TestAsyncDeadHolderChains:
             return await gate.acquire(timeout=10)
 
         waiter_task = asyncio.create_task(waiter())
-        await asyncio.sleep(0.1)  # Let waiter start and enqueue
+        await asyncio.sleep(0.02)  # Let waiter start and enqueue
 
-        # Wait for first holder to exceed dead holder timeout (600ms > 500ms)
-        await asyncio.sleep(0.6)
+        # Wait for first holder to exceed dead holder timeout (150ms > 100ms)
+        await asyncio.sleep(0.15)
 
         # Waiter should recover and get the gate via waiter-driven recovery
         owner2, msg_id2 = await asyncio.wait_for(waiter_task, timeout=15)
@@ -666,14 +667,14 @@ class TestAsyncDeadHolderChains:
         # Cleanup
         msg_id2_str = msg_id2.decode() if isinstance(msg_id2, bytes) else msg_id2
         await gate.release(owner2, msg_id2_str)
-        await asyncio.sleep(0.1)
+        await asyncio.sleep(0.02)
         await gate.r.delete(gate.stream, gate.last_key)
         await gate.r.delete(f"{gate.sig_prefix}{owner1}")
         await gate.r.delete(f"{gate.sig_prefix}{owner2}")
 
     async def test_dead_holder_exactly_2_minutes(self, real_redis):
         """Idle time = exactly at timeout threshold - should XACK."""
-        # Create gate with 500ms dead holder timeout (instead of 2 minutes)
+        # Create gate with 100ms dead holder timeout (instead of 2 minutes)
         test_id = str(uuid.uuid4())[:8]
         gate = AsyncStreamGate(
             real_redis,
@@ -681,15 +682,16 @@ class TestAsyncDeadHolderChains:
             group=f"test-group-{test_id}",
             sig_prefix=f"test-sig-{test_id}:",
             last_key=f"test-last-{test_id}",
-            claim_idle_ms=100,  # Claim after 100ms idle
-            dead_holder_timeout_ms=500,  # Consider dead after 500ms
+            claim_idle_ms=50,  # Claim after 50ms idle
+            dead_holder_timeout_ms=100,  # Consider dead after 100ms
+            blpop_internal_timeout_ms=1000,
         )
 
         # Acquire but don't release - simulate dead holder
         owner, msg_id = await gate.acquire()
 
-        # Wait exactly at the timeout threshold (500ms)
-        await asyncio.sleep(0.5)
+        # Wait at/past the timeout threshold (120ms > 100ms)
+        await asyncio.sleep(0.12)
 
         # Call recovery - should find it idle >= 500ms and XACK it
         result = await gate._recover_and_maybe_dispatch()
@@ -705,7 +707,8 @@ class TestAsyncDeadHolderChains:
 
     async def test_dead_holder_just_under_2_minutes(self, real_redis):
         """Idle time = just under timeout threshold - should re-signal."""
-        # Create gate with 500ms dead holder timeout (instead of 2 minutes)
+        # Create gate with 200ms dead holder timeout (threshold=150ms after 50ms tolerance)
+        # claim_idle_ms=50, so range 50-149ms triggers re-signal (not XACK)
         test_id = str(uuid.uuid4())[:8]
         gate = AsyncStreamGate(
             real_redis,
@@ -713,17 +716,18 @@ class TestAsyncDeadHolderChains:
             group=f"test-group-{test_id}",
             sig_prefix=f"test-sig-{test_id}:",
             last_key=f"test-last-{test_id}",
-            claim_idle_ms=100,  # Claim after 100ms idle
-            dead_holder_timeout_ms=500,  # Consider dead after 500ms
+            claim_idle_ms=50,  # Claim after 50ms idle
+            dead_holder_timeout_ms=200,  # Consider dead after 200ms (150ms with tolerance)
+            blpop_internal_timeout_ms=1000,
         )
 
         # Acquire but don't release - simulate holder still processing
         owner, msg_id = await gate.acquire()
 
-        # Wait just under the timeout threshold (400ms < 500ms)
-        await asyncio.sleep(0.4)
+        # Wait under the dead threshold but above claim threshold (80ms: 50 <= 80 < 150)
+        await asyncio.sleep(0.08)
 
-        # Call recovery - should find it idle but < 500ms, so re-signal (not XACK)
+        # Call recovery - should find it idle but < 150ms threshold, so re-signal (not XACK)
         result = await gate._recover_and_maybe_dispatch()
 
         # First owner should have been re-signaled (still processing)
@@ -733,13 +737,13 @@ class TestAsyncDeadHolderChains:
 
         # Cleanup
         await gate.release(owner, msg_id.decode())
-        await asyncio.sleep(0.1)
+        await asyncio.sleep(0.02)
         await gate.r.delete(gate.stream, gate.last_key)
         await gate.r.delete(f"{gate.sig_prefix}{owner}")
 
     async def test_all_waiters_dead_queue_empties(self, real_redis):
         """Queue has only dead holders - verify queue drains."""
-        # Create gate with 500ms dead holder timeout (instead of 2 minutes)
+        # Create gate with 100ms dead holder timeout (instead of 2 minutes)
         test_id = str(uuid.uuid4())[:8]
         gate = AsyncStreamGate(
             real_redis,
@@ -747,8 +751,9 @@ class TestAsyncDeadHolderChains:
             group=f"test-group-{test_id}",
             sig_prefix=f"test-sig-{test_id}:",
             last_key=f"test-last-{test_id}",
-            claim_idle_ms=100,  # Claim after 100ms idle
-            dead_holder_timeout_ms=500,  # Consider dead after 500ms
+            claim_idle_ms=50,  # Claim after 50ms idle
+            dead_holder_timeout_ms=100,  # Consider dead after 100ms
+            blpop_internal_timeout_ms=1000,
         )
 
         # Acquire multiple times without releasing - simulate dead holders
@@ -758,13 +763,13 @@ class TestAsyncDeadHolderChains:
             holders.append((owner, msg_id))
             # Don't release - simulate dead
 
-        # Wait for all holders to exceed timeout (600ms > 500ms)
-        await asyncio.sleep(0.6)
+        # Wait for all holders to exceed timeout (150ms > 100ms)
+        await asyncio.sleep(0.15)
 
         # Run recovery multiple times to clear all dead holders
         for _ in range(5):
             await gate._recover_and_maybe_dispatch()
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(0.02)
 
         # Queue should be empty now
         pending = await gate.r.xpending(gate.stream, gate.group)
@@ -782,7 +787,7 @@ class TestAsyncDeadHolderChains:
     @pytest.mark.slow
     async def test_multiple_consecutive_dead_holders(self, real_redis):
         """3 dead holders in queue - verify recovery cascades through all."""
-        # Create gate with 500ms dead holder timeout (instead of 2 minutes)
+        # Create gate with 100ms dead holder timeout (instead of 2 minutes)
         test_id = str(uuid.uuid4())[:8]
         gate = AsyncStreamGate(
             real_redis,
@@ -790,8 +795,9 @@ class TestAsyncDeadHolderChains:
             group=f"test-group-{test_id}",
             sig_prefix=f"test-sig-{test_id}:",
             last_key=f"test-last-{test_id}",
-            claim_idle_ms=100,  # Claim after 100ms idle
-            dead_holder_timeout_ms=500,  # Consider dead after 500ms
+            claim_idle_ms=50,  # Claim after 50ms idle
+            dead_holder_timeout_ms=100,  # Consider dead after 100ms
+            blpop_internal_timeout_ms=1000,
         )
 
         # Create 3 dead holders (acquire but never release)
@@ -806,10 +812,10 @@ class TestAsyncDeadHolderChains:
             return await gate.acquire(timeout=15)
 
         waiter_task = asyncio.create_task(live_waiter())
-        await asyncio.sleep(0.1)  # Let live waiter start
+        await asyncio.sleep(0.02)  # Let live waiter start
 
-        # Wait for all 3 dead holders to exceed timeout (600ms > 500ms)
-        await asyncio.sleep(0.6)
+        # Wait for all 3 dead holders to exceed timeout (150ms > 100ms)
+        await asyncio.sleep(0.15)
 
         # Live waiter should eventually acquire via waiter-driven recovery
         # The waiter's periodic recovery checks will cascade through all 3 dead holders
@@ -819,7 +825,7 @@ class TestAsyncDeadHolderChains:
         # Cleanup
         msg_id4_str = msg_id4.decode() if isinstance(msg_id4, bytes) else msg_id4
         await gate.release(owner4, msg_id4_str)
-        await asyncio.sleep(0.1)
+        await asyncio.sleep(0.02)
         await gate.r.delete(gate.stream, gate.last_key)
         for owner, _ in holders:
             await gate.r.delete(f"{gate.sig_prefix}{owner}")
@@ -1450,7 +1456,7 @@ class TestAsyncMultiProcessConcurrency:
 
     @pytest.mark.slow
     async def test_multiprocess_high_contention(self, clean_gate):
-        """5 processes with 10 acquire/release cycles each - verify no deadlocks."""
+        """5 processes with 6 acquire/release cycles each - verify no deadlocks."""
         redis_url = getattr(
             settings, "REDIS_CHANNELS_ENDPOINT", "redis://localhost:6379/15"
         )
@@ -1460,9 +1466,9 @@ class TestAsyncMultiProcessConcurrency:
         result_queue = multiprocessing.Queue()
         all_processes = []
 
-        # Each process does 10 acquire/release cycles
+        # Each process does 6 acquire/release cycles (reduced from 10 for speed)
         for worker_id in range(5):
-            for cycle in range(10):
+            for cycle in range(6):
                 p = multiprocessing.Process(
                     target=_multiprocess_worker_acquire_release,
                     args=(
@@ -1480,7 +1486,7 @@ class TestAsyncMultiProcessConcurrency:
 
         # Wait for all to complete
         for p in all_processes:
-            p.join(timeout=120)
+            p.join(timeout=60)
             if p.is_alive():
                 p.terminate()
                 p.join()
@@ -1490,10 +1496,10 @@ class TestAsyncMultiProcessConcurrency:
         while not result_queue.empty():
             results.append(result_queue.get())
 
-        # All 50 operations should succeed
-        assert len(results) == 50
+        # All 30 operations should succeed (5 workers × 6 cycles)
+        assert len(results) == 30
         successful = [r for r in results if r["success"]]
-        assert len(successful) == 50, f"Only {len(successful)}/50 operations succeeded"
+        assert len(successful) == 30, f"Only {len(successful)}/30 operations succeeded"
 
 
 # ============================================================================

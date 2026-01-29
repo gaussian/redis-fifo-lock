@@ -40,6 +40,7 @@ class AsyncStreamGate:
         claim_idle_ms: int = DEFAULT_CLAIM_IDLE_MS,
         last_key: str = DEFAULT_LAST_KEY,
         dead_holder_timeout_ms: int = 120_000,
+        blpop_internal_timeout_ms: int = 5_000,
     ):
         """
         Initialize AsyncStreamGate.
@@ -54,6 +55,7 @@ class AsyncStreamGate:
             claim_idle_ms: Idle time before considering a holder dead
             last_key: Key to store the last dispatched message ID
             dead_holder_timeout_ms: Idle time (ms) before considering holder truly dead (default 2 minutes)
+            blpop_internal_timeout_ms: Internal BLPOP timeout in milliseconds for waiter recovery loop (default 5000)
         """
         self.r = r
         self.stream = stream
@@ -64,6 +66,7 @@ class AsyncStreamGate:
         self.claim_idle_ms = claim_idle_ms
         self.last_key = last_key
         self.dead_holder_timeout_ms = dead_holder_timeout_ms
+        self.blpop_internal_timeout_ms = blpop_internal_timeout_ms
 
     async def ensure_group(self) -> None:
         """Create stream + group if missing."""
@@ -235,8 +238,8 @@ class AsyncStreamGate:
         deadline = None if timeout is None else (asyncio.get_event_loop().time() + timeout)
 
         while True:
-            # Internal wait: 5 seconds for periodic recovery checks
-            internal_timeout = 5
+            # Internal wait for periodic recovery checks
+            internal_timeout = max(1, self.blpop_internal_timeout_ms // 1000)
             if deadline is not None:
                 remaining = deadline - asyncio.get_event_loop().time()
                 if remaining <= 0:
