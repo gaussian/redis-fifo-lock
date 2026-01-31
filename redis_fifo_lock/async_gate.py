@@ -221,16 +221,25 @@ class AsyncStreamGate:
                 count=1,
                 block=1,  # 1ms timeout (essentially non-blocking, block=0 means wait forever!)
             )
-            # Validate that we got our message
+            # Validate that we got a message
             if not res or not res[0] or not res[0][1]:
                 raise RuntimeError(
                     f"XREADGROUP returned no messages after SETNX succeeded. "
                     f"Expected to claim msg_id {msg_id}"
                 )
-            # Signal ourselves - we'll wait on BLPOP below to consume the signal
-            sig_key = self.sig_prefix + owner
-            await self.r.lpush(sig_key, 1)
-            await self.r.pexpire(sig_key, self.sig_ttl_ms)
+
+            # Check if the message we read is our own
+            read_msg_id, read_fields = res[0][1][0]
+
+            if read_msg_id == msg_id:
+                # We read our own message - we're first in FIFO! Signal ourselves.
+                sig_key = self.sig_prefix + owner
+                await self.r.lpush(sig_key, 1)
+                await self.r.pexpire(sig_key, self.sig_ttl_ms)
+            else:
+                # We read someone else's message - they're first in FIFO.
+                # Dispatch them (signal + set last_key) and wait for our turn.
+                await self._dispatch_waiter((read_msg_id, read_fields))
 
         # 3) Block until the dispatcher signals you (could be ourselves or previous holder)
         # Use internal timeout loop for waiter-driven crash recovery
@@ -360,7 +369,9 @@ class AsyncStreamGate:
 
             async def __aexit__(self, exc_type, exc, tb):
                 # Always release; idempotent enough for typical use.
-                await self.gate.release(self.owner, self.msg_id)
+                # Decode msg_id if bytes (Redis returns bytes by default)
+                msg_id_str = self.msg_id.decode() if isinstance(self.msg_id, bytes) else self.msg_id
+                await self.gate.release(self.owner, msg_id_str)
                 return False
 
         return _Session(self, timeout)

@@ -114,6 +114,7 @@ class TestAsyncStreamGateAcquire:
     async def test_acquire_success(self, async_stream_gate, mock_async_redis):
         """Test successful acquire."""
         mock_async_redis.xadd.return_value = b"1234567890-0"
+        mock_async_redis.set.return_value = False  # Not first waiter (SETNX fails)
         mock_async_redis.blpop.return_value = (b"gate:sig:test-uuid", b"1")
 
         owner, msg_id = await async_stream_gate.acquire()
@@ -137,6 +138,7 @@ class TestAsyncStreamGateAcquire:
     async def test_acquire_with_timeout(self, async_stream_gate, mock_async_redis):
         """Test acquire with timeout parameter."""
         mock_async_redis.xadd.return_value = b"1234567890-0"
+        mock_async_redis.set.return_value = False  # Not first waiter (SETNX fails)
         mock_async_redis.blpop.return_value = (b"gate:sig:test-uuid", b"1")
 
         await async_stream_gate.acquire(timeout=30)
@@ -150,6 +152,7 @@ class TestAsyncStreamGateAcquire:
     async def test_acquire_timeout_reached(self, async_stream_gate, mock_async_redis):
         """Test acquire when timeout is reached."""
         mock_async_redis.xadd.return_value = b"1234567890-0"
+        mock_async_redis.set.return_value = False  # Not first waiter (SETNX fails)
         mock_async_redis.blpop.return_value = None  # Timeout
 
         with pytest.raises(asyncio.TimeoutError, match="acquire timed out"):
@@ -344,6 +347,81 @@ class TestAsyncStreamGateIssueFixesNormalOperation:
         lpush_calls = [call[0][0] for call in mock_async_redis.lpush.call_args_list]
         # Check if owner-2 was signaled (should be second lpush call after first waiter's self-signal)
         assert any("owner-2" in str(call) for call in lpush_calls), f"Expected 'owner-2' in lpush calls: {lpush_calls}"
+
+
+class TestAsyncStreamGateSETNXRaceFix:
+    """Tests for SETNX race condition fix - when winner reads someone else's message."""
+
+    @pytest.mark.asyncio
+    async def test_setnx_winner_reads_others_message_dispatches_correctly(
+        self, async_stream_gate, mock_async_redis
+    ):
+        """
+        Test the SETNX race condition fix:
+        - B wins SETNX but reads A's message (A was first in stream)
+        - B should dispatch A, not signal themselves
+        """
+        # B wins SETNX, but A's message is first in stream
+        msg_id_b = b"2222222222-0"  # B's message (later timestamp)
+        msg_id_a = b"1111111111-0"  # A's message (earlier timestamp)
+
+        mock_async_redis.xadd.return_value = msg_id_b  # B adds their message
+        mock_async_redis.set.return_value = True  # B wins SETNX
+        # But XREADGROUP returns A's message (first in stream FIFO order)
+        mock_async_redis.xreadgroup.return_value = [
+            (b"gate:stream", [(msg_id_a, {b"owner": b"owner-A"})])
+        ]
+        mock_async_redis.blpop.return_value = (b"gate:sig:owner-B", b"1")
+        mock_async_redis.lpush.reset_mock()
+        mock_async_redis.set.reset_mock()
+
+        owner_b, returned_msg_id = await async_stream_gate.acquire()
+
+        # B should return their own msg_id (not A's)
+        assert returned_msg_id == msg_id_b
+
+        # Verify owner-A was dispatched (signaled), not owner-B self-signaling
+        lpush_calls = [str(call) for call in mock_async_redis.lpush.call_args_list]
+        assert any("owner-A" in call for call in lpush_calls), (
+            f"Expected owner-A to be dispatched, got: {lpush_calls}"
+        )
+
+        # Verify last_key was set to A's message (the one dispatched)
+        set_calls = [str(call) for call in mock_async_redis.set.call_args_list]
+        assert any(str(msg_id_a) in call for call in set_calls), (
+            f"Expected last_key set to {msg_id_a}, got: {set_calls}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_setnx_winner_reads_own_message_signals_self(
+        self, async_stream_gate, mock_async_redis
+    ):
+        """
+        Test normal case: SETNX winner is also first in stream.
+        Should signal themselves.
+        """
+        msg_id = b"1234567890-0"
+
+        mock_async_redis.xadd.return_value = msg_id
+        mock_async_redis.set.return_value = True  # Wins SETNX
+        # XREADGROUP returns our own message (we're first)
+        mock_async_redis.xreadgroup.return_value = [
+            (b"gate:stream", [(msg_id, {b"owner": b"test-owner"})])
+        ]
+        mock_async_redis.blpop.return_value = (b"gate:sig:test-owner", b"1")
+        mock_async_redis.lpush.reset_mock()
+
+        owner, returned_msg_id = await async_stream_gate.acquire()
+
+        assert returned_msg_id == msg_id
+
+        # Verify we signaled ourselves (owner UUID from acquire, not "test-owner" from stream)
+        lpush_calls = mock_async_redis.lpush.call_args_list
+        assert len(lpush_calls) == 1
+        sig_key = lpush_calls[0][0][0]
+        assert sig_key.startswith("gate:sig:")
+        # The owner should be the UUID we generated, which we signaled
+        assert owner in sig_key
 
 
 class TestAsyncStreamGateIssueFixesWaiterDrivenRecovery:
