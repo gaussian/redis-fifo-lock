@@ -208,9 +208,11 @@ class TestAsyncRealRedisIntegration:
         assert ttl > 0, f"Signal key should exist with positive TTL, got {ttl}"
         assert ttl <= 300000  # Should be <= 5 minutes
 
-        # Clean up: acquire as second waiter and release
-        owner2_acquired, msg_id2_acquired = await clean_gate.acquire()
-        await clean_gate.release(owner2_acquired, msg_id2_acquired.decode())
+        # Clean up: manually consume owner2's signal and ack their message
+        # (owner2 was created via xadd, not acquire(), so we clean up manually)
+        await clean_gate.r.delete(sig_key)  # Remove the signal
+        await clean_gate.r.xack(clean_gate.stream, clean_gate.group, msg_id2)
+        await clean_gate.r.delete(clean_gate.last_key)  # Clear the holder pointer
 
     async def test_real_redis_stream_growth(self, clean_gate):
         """Verify stream doesn't grow unbounded over 100 cycles."""

@@ -114,6 +114,7 @@ class TestAsyncStreamGateAcquire:
     async def test_acquire_success(self, async_stream_gate, mock_async_redis):
         """Test successful acquire."""
         mock_async_redis.xadd.return_value = b"1234567890-0"
+        mock_async_redis.set.return_value = False  # Not first waiter (SETNX fails)
         mock_async_redis.blpop.return_value = (b"gate:sig:test-uuid", b"1")
 
         owner, msg_id = await async_stream_gate.acquire()
@@ -137,6 +138,7 @@ class TestAsyncStreamGateAcquire:
     async def test_acquire_with_timeout(self, async_stream_gate, mock_async_redis):
         """Test acquire with timeout parameter."""
         mock_async_redis.xadd.return_value = b"1234567890-0"
+        mock_async_redis.set.return_value = False  # Not first waiter (SETNX fails)
         mock_async_redis.blpop.return_value = (b"gate:sig:test-uuid", b"1")
 
         await async_stream_gate.acquire(timeout=30)
@@ -150,6 +152,7 @@ class TestAsyncStreamGateAcquire:
     async def test_acquire_timeout_reached(self, async_stream_gate, mock_async_redis):
         """Test acquire when timeout is reached."""
         mock_async_redis.xadd.return_value = b"1234567890-0"
+        mock_async_redis.set.return_value = False  # Not first waiter (SETNX fails)
         mock_async_redis.blpop.return_value = None  # Timeout
 
         with pytest.raises(asyncio.TimeoutError, match="acquire timed out"):
