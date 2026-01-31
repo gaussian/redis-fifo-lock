@@ -1,0 +1,66 @@
+# Configuration for GitHub's auto-generated release notes
+
+changelog:
+  exclude:
+    labels:
+      - 'duplicate'
+      - 'wontfix'
+      - 'invalid'
+      - 'ignore-for-release'
+    authors:
+      - 'github-actions[bot]'
+      - 'dependabot[bot]'
+
+  categories:
+    - title: Breaking Changes
+      labels:
+        - 'breaking'
+        - 'breaking-change'
+        - 'Semver-Major'
+
+    - title: Features
+      labels:
+        - 'feature'
+        - 'enhancement'
+        - 'feat'
+        - 'Semver-Minor'
+
+    - title: Bug Fixes
+      labels:
+        - 'bug'
+        - 'fix'
+        - 'bugfix'
+
+    - title: Maintenance
+      labels:
+        - 'chore'
+        - 'maintenance'
+        - 'refactor'
+
+    - title: Documentation
+      labels:
+        - 'documentation'
+        - 'docs'
+
+    - title: Performance
+      labels:
+        - 'performance'
+        - 'optimization'
+
+    - title: Tests
+      labels:
+        - 'test'
+        - 'testing'
+
+    - title: Dependencies
+      labels:
+        - 'dependencies'
+        - 'deps'
+
+    - title: Security
+      labels:
+        - 'security'
+
+    - title: Other Changes
+      labels:
+        - '*'

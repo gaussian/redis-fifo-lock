@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, Mock, patch
 import pytest
 import redis
 
-from neutron.redis_stream.sync import StreamGate
+from redis_fifo_lock.sync import StreamGate
 
 
 @pytest.fixture

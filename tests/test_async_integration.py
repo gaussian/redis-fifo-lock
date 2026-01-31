@@ -16,26 +16,25 @@ Skip if Redis unavailable: Tests will skip gracefully
 
 import asyncio
 import multiprocessing
+import os
 import time
 import uuid
 
 import pytest
 import pytest_asyncio
 import redis.asyncio as redis
-from django.conf import settings
 
-from neutron.redis_stream.async_gate import AsyncStreamGate
+from redis_fifo_lock.async_gate import AsyncStreamGate
 
 
 @pytest_asyncio.fixture
 async def real_redis():
     """
     Real Redis connection for integration tests.
-    Uses Django settings.REDIS_CHANNELS_ENDPOINT for connection.
+    Uses REDIS_URL environment variable or defaults to localhost.
     Skips tests if Redis is not available.
     """
-    # Get Redis connection info from Django settings
-    redis_url = getattr(settings, "REDIS_CHANNELS_ENDPOINT", "redis://localhost:6379/15")
+    redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379/15")
     if not redis_url.startswith("redis://") and not redis_url.startswith("rediss://"):
         # If it's just host:port, construct the URL
         redis_url = f"redis://{redis_url}/15"
@@ -252,9 +251,7 @@ class TestAsyncRealRedisIntegration:
         await asyncio.sleep(0)
 
         # Simulate reconnect by creating new Redis client
-        redis_url = getattr(
-            settings, "REDIS_CHANNELS_ENDPOINT", "redis://localhost:6379/15"
-        )
+        redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379/15")
         if not redis_url.startswith("redis://") and not redis_url.startswith("rediss://"):
             redis_url = f"redis://{redis_url}/15"
         new_client = await redis.from_url(redis_url, decode_responses=False)
@@ -1134,9 +1131,7 @@ class TestAsyncMultiProcessConcurrency:
     async def test_multiprocess_simultaneous_acquire(self, clean_gate):
         """3 processes try to acquire simultaneously - verify FIFO order."""
         # Get Redis URL for worker processes
-        redis_url = getattr(
-            settings, "REDIS_CHANNELS_ENDPOINT", "redis://localhost:6379/15"
-        )
+        redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379/15")
         if not redis_url.startswith("redis://") and not redis_url.startswith("rediss://"):
             redis_url = f"redis://{redis_url}/15"
 
@@ -1200,9 +1195,7 @@ class TestAsyncMultiProcessConcurrency:
 
     async def test_multiprocess_setnx_race(self, clean_gate):
         """5 processes race on SETNX(last_key) - verify only one wins at a time."""
-        redis_url = getattr(
-            settings, "REDIS_CHANNELS_ENDPOINT", "redis://localhost:6379/15"
-        )
+        redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379/15")
         if not redis_url.startswith("redis://") and not redis_url.startswith("rediss://"):
             redis_url = f"redis://{redis_url}/15"
 
@@ -1255,9 +1248,7 @@ class TestAsyncMultiProcessConcurrency:
 
     async def test_multiprocess_one_holds_others_wait(self, clean_gate):
         """Process 1 holds gate, processes 2-4 wait and acquire in order."""
-        redis_url = getattr(
-            settings, "REDIS_CHANNELS_ENDPOINT", "redis://localhost:6379/15"
-        )
+        redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379/15")
         if not redis_url.startswith("redis://") and not redis_url.startswith("rediss://"):
             redis_url = f"redis://{redis_url}/15"
 
@@ -1322,9 +1313,7 @@ class TestAsyncMultiProcessConcurrency:
 
     async def test_multiprocess_holder_dies_recovery(self, clean_gate):
         """Process acquires then exits without releasing - other process recovers."""
-        redis_url = getattr(
-            settings, "REDIS_CHANNELS_ENDPOINT", "redis://localhost:6379/15"
-        )
+        redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379/15")
         if not redis_url.startswith("redis://") and not redis_url.startswith("rediss://"):
             redis_url = f"redis://{redis_url}/15"
 
@@ -1392,9 +1381,7 @@ class TestAsyncMultiProcessConcurrency:
 
     async def test_multiprocess_concurrent_release(self, clean_gate):
         """Two processes try to release same msg_id - double-release guard works."""
-        redis_url = getattr(
-            settings, "REDIS_CHANNELS_ENDPOINT", "redis://localhost:6379/15"
-        )
+        redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379/15")
         if not redis_url.startswith("redis://") and not redis_url.startswith("rediss://"):
             redis_url = f"redis://{redis_url}/15"
 
@@ -1459,9 +1446,7 @@ class TestAsyncMultiProcessConcurrency:
     @pytest.mark.slow
     async def test_multiprocess_high_contention(self, clean_gate):
         """5 processes with 6 acquire/release cycles each - verify no deadlocks."""
-        redis_url = getattr(
-            settings, "REDIS_CHANNELS_ENDPOINT", "redis://localhost:6379/15"
-        )
+        redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379/15")
         if not redis_url.startswith("redis://") and not redis_url.startswith("rediss://"):
             redis_url = f"redis://{redis_url}/15"
 
