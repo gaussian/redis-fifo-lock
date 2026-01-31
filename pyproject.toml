@@ -13,7 +13,7 @@ readme = "redis_fifo_lock/README.md"
 license = "MIT"
 requires-python = ">=3.10"
 dependencies = [
-  "redis>=4.0.0",
+  "redis[hiredis]>=7.1",                # hiredis speeds up bulk redis performance
 ]
 
 [project.optional-dependencies]
