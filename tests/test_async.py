@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 import redis.asyncio as redis
 
-from neutron.redis_stream.async_gate import AsyncStreamGate
+from redis_fifo_lock.async_gate import AsyncStreamGate
 
 
 @pytest.fixture

@@ -16,7 +16,7 @@ This module provides both synchronous and asynchronous lock-like classes that en
 
 ```python
 import redis
-from neutron.redis_stream import StreamGate
+from redis_fifo_lock import StreamGate
 
 # Create Redis client
 r = redis.Redis(host='localhost', port=6379, db=0)
@@ -54,7 +54,7 @@ except TimeoutError:
 ```python
 import asyncio
 import redis.asyncio as redis
-from neutron.redis_stream import AsyncStreamGate
+from redis_fifo_lock import AsyncStreamGate
 
 async def worker(name: str, gate: AsyncStreamGate):
     async with await gate.session():   # blocks until it's your turn
@@ -76,7 +76,7 @@ asyncio.run(main())
 
 ```python
 import redis.asyncio as redis
-from neutron.redis_stream import AsyncStreamGate
+from redis_fifo_lock import AsyncStreamGate
 
 async def main():
     r = redis.Redis(host="localhost", port=6379, db=0)
@@ -171,3 +171,10 @@ XINFO GROUPS gate:stream
 5. **Crash Recovery**: If a holder dies, their message stays pending. The next `release()` uses `XAUTOCLAIM` to detect and re-signal stuck holders after `claim_idle_ms` milliseconds
 
 This keeps exactly one pending message representing the active holder.
+
+## Development
+
+```bash
+uv sync --all-extras
+uv run pytest
+```

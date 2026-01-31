@@ -6,7 +6,7 @@ import os
 
 import pytest
 
-from neutron.redis_stream.common import (
+from redis_fifo_lock.common import (
     DEFAULT_CLAIM_IDLE_MS,
     DEFAULT_GROUP,
     DEFAULT_LAST_KEY,
