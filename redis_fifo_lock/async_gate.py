@@ -244,7 +244,9 @@ class AsyncStreamGate:
         # 3) Block until the dispatcher signals you (could be ourselves or previous holder)
         # Use internal timeout loop for waiter-driven crash recovery
         sig_key = self.sig_prefix + owner
-        deadline = None if timeout is None else (asyncio.get_event_loop().time() + timeout)
+        deadline = (
+            None if timeout is None else (asyncio.get_event_loop().time() + timeout)
+        )
 
         while True:
             # Internal wait for periodic recovery checks
@@ -370,7 +372,11 @@ class AsyncStreamGate:
             async def __aexit__(self, exc_type, exc, tb):
                 # Always release; idempotent enough for typical use.
                 # Decode msg_id if bytes (Redis returns bytes by default)
-                msg_id_str = self.msg_id.decode() if isinstance(self.msg_id, bytes) else self.msg_id
+                msg_id_str = (
+                    self.msg_id.decode()
+                    if isinstance(self.msg_id, bytes)
+                    else self.msg_id
+                )
                 await self.gate.release(self.owner, msg_id_str)
                 return False
 

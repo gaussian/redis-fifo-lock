@@ -19,7 +19,7 @@ import redis
 from redis_fifo_lock import StreamGate
 
 # Create Redis client
-r = redis.Redis(host='localhost', port=6379, db=0)
+r = redis.Redis(host="localhost", port=6379, db=0)
 
 # Create gate
 gate = StreamGate(r)
@@ -56,10 +56,12 @@ import asyncio
 import redis.asyncio as redis
 from redis_fifo_lock import AsyncStreamGate
 
+
 async def worker(name: str, gate: AsyncStreamGate):
-    async with await gate.session():   # blocks until it's your turn
+    async with await gate.session():  # blocks until it's your turn
         print(f"{name} running…")
-        await asyncio.sleep(0.5)       # do exclusive work
+        await asyncio.sleep(0.5)  # do exclusive work
+
 
 async def main():
     r = redis.Redis(host="localhost", port=6379, db=0)
@@ -69,6 +71,7 @@ async def main():
     tasks = [asyncio.create_task(worker(f"W{i}", gate)) for i in range(5)]
     await asyncio.gather(*tasks)
 
+
 asyncio.run(main())
 ```
 
@@ -77,6 +80,7 @@ asyncio.run(main())
 ```python
 import redis.asyncio as redis
 from redis_fifo_lock import AsyncStreamGate
+
 
 async def main():
     r = redis.Redis(host="localhost", port=6379, db=0)
