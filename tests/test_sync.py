@@ -15,7 +15,12 @@ from redis_fifo_lock.sync import StreamGate
 @pytest.fixture
 def mock_redis():
     """Create a mock Redis client."""
-    return MagicMock(spec=redis.Redis)
+    mock = MagicMock(spec=redis.Redis)
+    # SETNX on last_key decides whether acquire() takes the lock or waits for it.
+    # Default to "someone else holds it", so tests exercise the waiter path
+    # unless they opt in to the dispatch path.
+    mock.set.return_value = False
+    return mock
 
 
 @pytest.fixture
@@ -116,9 +121,11 @@ class TestStreamGateAcquire:
 
         stream_gate.acquire(timeout=30)
 
-        # Verify blpop was called with timeout
-        call_args = mock_redis.blpop.call_args
-        assert call_args[1]["timeout"] == 30
+        # The caller's timeout is a deadline for acquire(), not a single BLPOP:
+        # the waiter loops so no individual block outlives the client's socket
+        # timeout. Blocking for the full 30s is exactly the bug this guards.
+        block = mock_redis.blpop.call_args[1]["timeout"]
+        assert 0 < block <= stream_gate.blpop_internal_timeout_ms / 1000.0
 
     def test_acquire_timeout_reached(self, stream_gate, mock_redis):
         """Test acquire when timeout is reached."""
@@ -131,6 +138,49 @@ class TestStreamGateAcquire:
         # Verify cleanup was attempted
         assert mock_redis.xdel.called
         assert mock_redis.delete.called
+
+    def test_acquire_on_idle_gate_signals_itself(self, stream_gate, mock_redis):
+        """Winning SETNX on an idle gate means dispatching yourself."""
+        mock_redis.xadd.return_value = b"1234567890-0"
+        mock_redis.set.return_value = True  # nobody holds the lock
+        mock_redis.xreadgroup.return_value = [
+            ("gate:stream", [(b"1234567890-0", {b"owner": b"self"})])
+        ]
+        mock_redis.blpop.return_value = (b"gate:sig:test-uuid", b"1")
+
+        owner, msg_id = stream_gate.acquire()
+
+        assert msg_id == b"1234567890-0"
+        # Signalled itself rather than waiting for a dispatcher that isn't there
+        assert mock_redis.lpush.call_args[0][0] == f"gate:sig:{owner}"
+
+    def test_acquire_on_idle_gate_defers_to_earlier_ticket(
+        self, stream_gate, mock_redis
+    ):
+        """Winning SETNX does not mean being first in FIFO."""
+        mock_redis.xadd.return_value = b"1234567890-1"
+        mock_redis.set.return_value = True
+        mock_redis.xreadgroup.return_value = [
+            ("gate:stream", [(b"1234567890-0", {b"owner": b"earlier-owner"})])
+        ]
+        mock_redis.blpop.return_value = (b"gate:sig:test-uuid", b"1")
+
+        stream_gate.acquire()
+
+        # The earlier ticket gets the baton and becomes the active entry
+        assert mock_redis.lpush.call_args[0][0] == "gate:sig:earlier-owner"
+        assert mock_redis.set.call_args[0] == ("gate:last-dispatched", b"1234567890-0")
+
+    def test_acquire_raises_if_setnx_wins_but_stream_is_empty(
+        self, stream_gate, mock_redis
+    ):
+        """An empty read after winning SETNX means the stream lost our ticket."""
+        mock_redis.xadd.return_value = b"1234567890-0"
+        mock_redis.set.return_value = True
+        mock_redis.xreadgroup.return_value = []
+
+        with pytest.raises(RuntimeError, match="XREADGROUP returned no messages"):
+            stream_gate.acquire()
 
 
 class TestStreamGateRelease:

@@ -9,12 +9,16 @@ from typing import Optional, Tuple
 import redis.asyncio as redis
 
 from redis_fifo_lock.common import (
+    DEFAULT_BLPOP_INTERNAL_TIMEOUT_MS,
     DEFAULT_CLAIM_IDLE_MS,
     DEFAULT_GROUP,
     DEFAULT_LAST_KEY,
     DEFAULT_SIG_PREFIX,
     DEFAULT_SIG_TTL_MS,
     DEFAULT_STREAM,
+    MAX_CONSECUTIVE_BLPOP_TIMEOUTS,
+    blpop_block_seconds,
+    effective_socket_timeout,
     get_advancer_consumer,
 )
 
@@ -40,7 +44,7 @@ class AsyncStreamGate:
         claim_idle_ms: int = DEFAULT_CLAIM_IDLE_MS,
         last_key: str = DEFAULT_LAST_KEY,
         dead_holder_timeout_ms: int = 120_000,
-        blpop_internal_timeout_ms: int = 5_000,
+        blpop_internal_timeout_ms: int = DEFAULT_BLPOP_INTERNAL_TIMEOUT_MS,
     ):
         """
         Initialize AsyncStreamGate.
@@ -55,7 +59,9 @@ class AsyncStreamGate:
             claim_idle_ms: Idle time before considering a holder dead
             last_key: Key to store the last dispatched message ID
             dead_holder_timeout_ms: Idle time (ms) before considering holder truly dead (default 2 minutes)
-            blpop_internal_timeout_ms: Internal BLPOP timeout in milliseconds for waiter recovery loop (default 5000)
+            blpop_internal_timeout_ms: Internal BLPOP timeout in milliseconds for
+                waiter recovery loop (default 5000). Capped at runtime so each
+                BLPOP returns before the client's own socket timeout.
         """
         self.r = r
         self.stream = stream
@@ -67,6 +73,7 @@ class AsyncStreamGate:
         self.last_key = last_key
         self.dead_holder_timeout_ms = dead_holder_timeout_ms
         self.blpop_internal_timeout_ms = blpop_internal_timeout_ms
+        self._socket_timeout = effective_socket_timeout(r)
 
     async def ensure_group(self) -> None:
         """Create stream + group if missing."""
@@ -244,23 +251,43 @@ class AsyncStreamGate:
         # 3) Block until the dispatcher signals you (could be ourselves or previous holder)
         # Use internal timeout loop for waiter-driven crash recovery
         sig_key = self.sig_prefix + owner
-        deadline = (
-            None if timeout is None else (asyncio.get_event_loop().time() + timeout)
-        )
+        loop = asyncio.get_event_loop()
+        deadline = None if timeout is None else (loop.time() + timeout)
+        consecutive_timeouts = 0
 
         while True:
-            # Internal wait for periodic recovery checks
-            internal_timeout = max(1, self.blpop_internal_timeout_ms // 1000)
+            remaining = None
             if deadline is not None:
-                remaining = deadline - asyncio.get_event_loop().time()
+                remaining = deadline - loop.time()
                 if remaining <= 0:
                     # User timeout reached
                     await self._cancel_ticket(owner, msg_id, sig_key)
                     raise asyncio.TimeoutError("acquire timed out waiting for dispatch")
-                # Use smaller of internal timeout or remaining time
-                internal_timeout = min(internal_timeout, max(1, int(remaining)))
 
-            res = await self.r.blpop(sig_key, timeout=internal_timeout)
+            try:
+                res = await self.r.blpop(
+                    sig_key,
+                    timeout=blpop_block_seconds(
+                        self.blpop_internal_timeout_ms, self._socket_timeout, remaining
+                    ),
+                )
+            except redis.TimeoutError:
+                # The client's read deadline fired, not ours. That is the same
+                # event as a nil reply — nobody signalled us — so wake up and run
+                # recovery rather than failing the acquire. Bounded, because if
+                # it keeps happening the connection is dead, not idle.
+                consecutive_timeouts += 1
+                if consecutive_timeouts >= MAX_CONSECUTIVE_BLPOP_TIMEOUTS:
+                    try:
+                        await self._cancel_ticket(owner, msg_id, sig_key)
+                    except Exception:
+                        # The connection is already suspect; do not mask the
+                        # timeout with whatever cleanup hits on the way out.
+                        pass
+                    raise
+                res = None
+            else:
+                consecutive_timeouts = 0
 
             if res is not None:
                 # Got our signal → it's our turn
