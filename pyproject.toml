@@ -16,15 +16,16 @@ dependencies = [
   "redis[hiredis]>=8,<9",              # hiredis speeds up bulk redis performance
 ]
 
-[project.optional-dependencies]
-test = [
-  "pytest>=7.0.0",
-  "pytest-asyncio>=0.21.0",
-]
-
 [project.urls]
 Homepage = "https://github.com/gaussian/redis-fifo-lock"
 Issues = "https://github.com/gaussian/redis-fifo-lock/issues"
+
+[dependency-groups]
+dev = [
+  "pytest>=7.0.0",
+  "pytest-asyncio>=0.21.0",
+  "ruff>=0.10",
+]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
@@ -32,3 +33,15 @@ testpaths = ["tests"]
 markers = [
     "integration: marks tests as integration tests (require Redis)",
 ]
+
+[tool.ruff.lint]
+# Pin to the classic real-errors rule set (pyflakes + core pycodestyle) rather
+# than ruff's newer, broader default which pulls in style/modernization rules.
+# F401 (side-effect imports / re-exports look unused; F821 still catches
+# genuinely-missing imports) and F841 (intentional unused locals) are excluded.
+select = ["E4", "E7", "E9", "F"]
+ignore = ["F401", "F841"]
+
+[tool.ruff.lint.per-file-ignores]
+# __init__.py uses star imports to re-export the public API.
+"__init__.py" = ["F403"]

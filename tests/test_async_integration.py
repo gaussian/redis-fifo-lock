@@ -122,7 +122,9 @@ class TestAsyncRealRedisIntegration:
 
         # Verify message IDs are in order (Redis Streams are time-ordered)
         msg_ids = [r[1] for r in results]
-        assert msg_ids == sorted(msg_ids), "Message IDs should be in chronological order"
+        assert msg_ids == sorted(msg_ids), (
+            "Message IDs should be in chronological order"
+        )
 
     async def test_real_redis_message_id_generation(self, clean_gate):
         """Verify Redis generates real timestamp-based message IDs."""
@@ -252,7 +254,9 @@ class TestAsyncRealRedisIntegration:
 
         # Simulate reconnect by creating new Redis client
         redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379/15")
-        if not redis_url.startswith("redis://") and not redis_url.startswith("rediss://"):
+        if not redis_url.startswith("redis://") and not redis_url.startswith(
+            "rediss://"
+        ):
             redis_url = f"redis://{redis_url}/15"
         new_client = await redis.from_url(redis_url, decode_responses=False)
 
@@ -1132,7 +1136,9 @@ class TestAsyncMultiProcessConcurrency:
         """3 processes try to acquire simultaneously - verify FIFO order."""
         # Get Redis URL for worker processes
         redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379/15")
-        if not redis_url.startswith("redis://") and not redis_url.startswith("rediss://"):
+        if not redis_url.startswith("redis://") and not redis_url.startswith(
+            "rediss://"
+        ):
             redis_url = f"redis://{redis_url}/15"
 
         # Create a unique key to track acquisition order atomically
@@ -1196,7 +1202,9 @@ class TestAsyncMultiProcessConcurrency:
     async def test_multiprocess_setnx_race(self, clean_gate):
         """5 processes race on SETNX(last_key) - verify only one wins at a time."""
         redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379/15")
-        if not redis_url.startswith("redis://") and not redis_url.startswith("rediss://"):
+        if not redis_url.startswith("redis://") and not redis_url.startswith(
+            "rediss://"
+        ):
             redis_url = f"redis://{redis_url}/15"
 
         result_queue = multiprocessing.Queue()
@@ -1242,14 +1250,16 @@ class TestAsyncMultiProcessConcurrency:
             next_acquire = results_sorted[i + 1]["acquire_time"]
             # Next acquire should happen after or very close to current release
             # (allowing small timing variance)
-            assert (
-                next_acquire >= current_release - 0.1
-            ), f"Process {i+1} acquired before process {i} released"
+            assert next_acquire >= current_release - 0.1, (
+                f"Process {i + 1} acquired before process {i} released"
+            )
 
     async def test_multiprocess_one_holds_others_wait(self, clean_gate):
         """Process 1 holds gate, processes 2-4 wait and acquire in order."""
         redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379/15")
-        if not redis_url.startswith("redis://") and not redis_url.startswith("rediss://"):
+        if not redis_url.startswith("redis://") and not redis_url.startswith(
+            "rediss://"
+        ):
             redis_url = f"redis://{redis_url}/15"
 
         result_queue = multiprocessing.Queue()
@@ -1314,7 +1324,9 @@ class TestAsyncMultiProcessConcurrency:
     async def test_multiprocess_holder_dies_recovery(self, clean_gate):
         """Process acquires then exits without releasing - other process recovers."""
         redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379/15")
-        if not redis_url.startswith("redis://") and not redis_url.startswith("rediss://"):
+        if not redis_url.startswith("redis://") and not redis_url.startswith(
+            "rediss://"
+        ):
             redis_url = f"redis://{redis_url}/15"
 
         result_queue = multiprocessing.Queue()
@@ -1382,7 +1394,9 @@ class TestAsyncMultiProcessConcurrency:
     async def test_multiprocess_concurrent_release(self, clean_gate):
         """Two processes try to release same msg_id - double-release guard works."""
         redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379/15")
-        if not redis_url.startswith("redis://") and not redis_url.startswith("rediss://"):
+        if not redis_url.startswith("redis://") and not redis_url.startswith(
+            "rediss://"
+        ):
             redis_url = f"redis://{redis_url}/15"
 
         # Acquire in main process
@@ -1447,7 +1461,9 @@ class TestAsyncMultiProcessConcurrency:
     async def test_multiprocess_high_contention(self, clean_gate):
         """5 processes with 6 acquire/release cycles each - verify no deadlocks."""
         redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379/15")
-        if not redis_url.startswith("redis://") and not redis_url.startswith("rediss://"):
+        if not redis_url.startswith("redis://") and not redis_url.startswith(
+            "rediss://"
+        ):
             redis_url = f"redis://{redis_url}/15"
 
         result_queue = multiprocessing.Queue()
