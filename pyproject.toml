@@ -30,8 +30,14 @@ dev = [
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# The adversarial suite is slow and randomized on purpose. Keep the everyday
+# run fast; CI runs it explicitly with `-m adversarial` (a -m on the command
+# line overrides this one).
+addopts = "-m 'not adversarial'"
 markers = [
     "integration: marks tests as integration tests (require Redis)",
+    "adversarial: randomized concurrency invariant tests; slow, run on deploy",
+    "slow: long-running tests",
 ]
 
 [tool.ruff.lint]
