@@ -1,19 +1,13 @@
 """
-Common utilities and constants for Redis Stream gates.
+Client introspection shared by the lock.
+
+Both functions exist for the same reason: the caller supplies the Redis client,
+and the lock has to work with whatever they hand it rather than dictating its
+configuration.
 """
 
 import inspect
-import os
 from typing import Optional
-
-# Default configuration constants
-DEFAULT_STREAM = "gate:stream"
-DEFAULT_GROUP = "gate:group"
-DEFAULT_SIG_PREFIX = "gate:sig:"
-DEFAULT_SIG_TTL_MS = 5 * 60 * 1000  # 5 minutes
-DEFAULT_CLAIM_IDLE_MS = 60_000  # 60 seconds
-DEFAULT_LAST_KEY = "gate:last-dispatched"
-DEFAULT_BLPOP_INTERNAL_TIMEOUT_MS = 5_000
 
 # Fraction of the client's socket timeout we will spend inside a single blocking
 # call. redis-py enforces its read deadline client-side and raises (dropping the
@@ -22,26 +16,14 @@ DEFAULT_BLPOP_INTERNAL_TIMEOUT_MS = 5_000
 SOCKET_TIMEOUT_SAFETY_FACTOR = 0.5
 MIN_BLOCK_SECONDS = 0.1
 
-# Consecutive client-side read timeouts a waiter tolerates before deciding the
-# connection is dead rather than merely idle. Without a bound, absorbing them
-# would turn an unreachable Redis into a silent infinite wait.
-MAX_CONSECUTIVE_BLPOP_TIMEOUTS = 3
-
-
-def get_advancer_consumer(pid: int = None) -> str:
-    """Generate a dispatcher/advancer consumer identity."""
-    if pid is None:
-        pid = os.getpid()
-    return f"advancer:{pid}"
-
 
 def effective_socket_timeout(client) -> Optional[float]:
     """
     Best-effort read of the read deadline redis-py will enforce on this client.
 
-    The gate blocks server-side (BLPOP, XREADGROUP BLOCK) and must always come
-    back before that deadline, otherwise redis-py raises TimeoutError and tears
-    the connection down instead of the command simply returning nil. redis-py 8
+    The lock blocks server-side while waiting, and must always come back before
+    that deadline, otherwise redis-py raises TimeoutError and tears the
+    connection down instead of the command simply returning nil. redis-py 8
     made this pressing by defaulting ``socket_timeout`` to 5 seconds where
     earlier versions used ``None``.
 
@@ -79,15 +61,15 @@ def blpop_block_seconds(
     remaining: Optional[float],
 ) -> float:
     """
-    How long a single BLPOP in the waiter loop may block for.
+    How long a single blocking wait may block for.
 
-    Bounded by three things: the configured recovery interval, the client's
-    socket timeout (exceeding it turns a routine nil reply into a raised
-    TimeoutError and a dropped connection), and whatever is left of the caller's
-    own deadline.
+    Bounded by three things: the configured poll interval, the client's socket
+    timeout (exceeding it turns a routine nil reply into a raised TimeoutError
+    and a dropped connection), and whatever is left of the caller's own
+    deadline.
 
     Args:
-        configured_ms: The gate's ``blpop_internal_timeout_ms``
+        configured_ms: The lock's ``poll_ms``
         socket_timeout: Client read deadline in seconds, or None if unknown
         remaining: Seconds left on the caller's timeout, or None if infinite
 

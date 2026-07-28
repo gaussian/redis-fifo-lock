@@ -19,7 +19,7 @@ from typing import Optional
 
 import redis.asyncio as redis
 
-from redis_fifo_lock.async_gate import AsyncStreamGate
+from redis_fifo_lock.lock import FifoLock
 
 
 def redis_url() -> str:
@@ -27,19 +27,6 @@ def redis_url() -> str:
     if not url.startswith("redis://") and not url.startswith("rediss://"):
         url = f"redis://{url}/15"
     return url
-
-
-def stream_id_order(msg_id) -> tuple:
-    """
-    Sort key for a Redis stream id.
-
-    ``b"1785-9"`` sorts before ``b"1785-10"`` numerically but after it
-    lexicographically, so comparing the raw bytes silently corrupts every FIFO
-    assertion built on top of it.
-    """
-    raw = msg_id.decode() if isinstance(msg_id, bytes) else str(msg_id)
-    ms, _, seq = raw.partition("-")
-    return (int(ms), int(seq or 0))
 
 
 class Grant:
@@ -64,6 +51,12 @@ class GateAdapter:
     #: Longest the implementation may take to reclaim a crashed holder.
     recovery_bound_s: float = 10.0
 
+    #: Longest the implementation may take to reclaim a lock whose caller went
+    #: away while its process kept running. Separate from recovery_bound_s
+    #: because an implementation that renews a lease in the background cannot
+    #: tell that case apart from honest work, and needs a longer backstop.
+    abandon_bound_s: float = 10.0
+
     async def acquire(self, timeout: Optional[float] = None) -> Grant:
         raise NotImplementedError
 
@@ -74,43 +67,58 @@ class GateAdapter:
         """Outstanding tickets. Must return to 0 once every holder releases."""
         raise NotImplementedError
 
+    async def abandon(self, grant: Grant) -> None:
+        """
+        Simulate the holder's process dying: stop doing anything that keeps the
+        lock alive, and never release. The lock must come back on its own.
+        """
+        raise NotImplementedError
+
     async def cleanup(self) -> None:
         raise NotImplementedError
 
 
-class StreamGateAdapter(GateAdapter):
-    """The shipped AsyncStreamGate (Redis Streams + consumer group)."""
+class FifoLockAdapter(GateAdapter):
+    """The ZSET + lease design."""
 
     def __init__(self, client, name: str, wake_ms: int, dead_holder_ms: int):
         self.r = client
         self.name = name
-        self.gate = AsyncStreamGate(
+        max_hold_ms = dead_holder_ms * 6
+        self.lock = FifoLock(
             client,
-            stream=f"{name}:stream",
-            group=f"{name}:group",
-            sig_prefix=f"{name}:sig:",
-            last_key=f"{name}:last",
-            blpop_internal_timeout_ms=wake_ms,
-            dead_holder_timeout_ms=dead_holder_ms,
-            claim_idle_ms=max(dead_holder_ms // 2, 1),
+            name,
+            lease_ms=dead_holder_ms,
+            poll_ms=wake_ms,
+            # Scaled to the suite's timescale exactly like every other interval
+            # here. Must sit above the longest legitimate hold the suite uses
+            # (4 recovery windows), as 30 minutes does over a 60s lease.
+            max_hold_ms=max_hold_ms,
         )
         self.recovery_bound_s = dead_holder_ms / 1000.0 * 3 + 2
+        # A live process renewing its own lease can only be reclaimed once the
+        # renewal cap expires, so this bound is necessarily longer.
+        self.abandon_bound_s = max_hold_ms / 1000.0 + dead_holder_ms / 1000.0 + 5
 
     async def acquire(self, timeout=None) -> Grant:
-        owner, msg_id = await self.gate.acquire(timeout=timeout)
-        return Grant((owner, msg_id), stream_id_order(msg_id))
+        lease = await self.lock.acquire(timeout=timeout)
+        # Order by ARRIVAL (pos), never by fence. The fence is minted at grant
+        # time, so ordering by it is monotonic by construction and the FIFO
+        # assertion could never fail — a test that cannot fail proves nothing.
+        return Grant(lease, lease.pos)
 
     async def release(self, grant: Grant) -> None:
-        owner, msg_id = grant.handle
-        await self.gate.release(
-            owner, msg_id.decode() if isinstance(msg_id, bytes) else msg_id
-        )
+        await self.lock.release(grant.handle)
 
     async def queue_size(self) -> int:
-        return await self.r.xlen(self.gate.stream)
+        return await self.r.zcard(f"{{{self.name}}}:q")
+
+    async def abandon(self, grant: Grant) -> None:
+        # Kill the renewal exactly as losing the process would, then walk away.
+        self.lock._stop_renew(grant.handle)
 
     async def cleanup(self) -> None:
-        keys = await self.r.keys(f"{self.name}:*")
+        keys = await self.r.keys(f"{{{self.name}}}:*")
         if keys:
             await self.r.delete(*keys)
 
@@ -213,6 +221,26 @@ async def hold(
 
 async def make_client():
     client = await redis.from_url(redis_url(), decode_responses=False)
+    await client.ping()
+    return client
+
+
+async def make_consumer_client():
+    """
+    A client built the way the only production consumer builds one.
+
+    That consumer creates a single process-global client with responses decoded
+    to ``str`` and no client-side deadline on either the connect or the read.
+    Every other client in this repository — unit, integration and adversarial —
+    is created with ``decode_responses=False``, so nothing else in the suite
+    ever hands the gate the types it actually sees in production.
+    """
+    client = await redis.from_url(
+        redis_url(),
+        decode_responses=True,
+        socket_timeout=None,
+        socket_connect_timeout=None,
+    )
     await client.ping()
     return client
 

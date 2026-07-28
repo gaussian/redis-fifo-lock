@@ -26,8 +26,8 @@ import random
 import pytest
 
 from .harness import (
+    FifoLockAdapter,
     Monitor,
-    StreamGateAdapter,
     hold,
     make_client,
     unique_name,
@@ -40,12 +40,18 @@ pytestmark = [pytest.mark.adversarial, pytest.mark.integration]
 WAKE_MS = 300
 DEAD_HOLDER_MS = 3_000
 
+#: Every implementation faces the identical suite. Nothing here knows how any
+#: of them works.
+IMPLEMENTATIONS = {
+    "fifolock": FifoLockAdapter,
+}
 
-@pytest.fixture
-async def gate():
+
+@pytest.fixture(params=sorted(IMPLEMENTATIONS))
+async def gate(request):
     client = await make_client()
-    adapter = StreamGateAdapter(
-        client, unique_name("mx"), wake_ms=WAKE_MS, dead_holder_ms=DEAD_HOLDER_MS
+    adapter = IMPLEMENTATIONS[request.param](
+        client, unique_name(request.param), WAKE_MS, DEAD_HOLDER_MS
     )
     try:
         yield adapter
@@ -181,6 +187,69 @@ async def test_abandoned_waiters_do_not_wedge_the_gate(gate):
     )
     assert survivor is not None, "gate was wedged by waiters that gave up"
     monitor.assert_exclusive()
+
+
+async def test_hold_far_beyond_the_recovery_window(gate):
+    """
+    Holding for a long time must not be mistaken for having died.
+
+    This is the property the whole design exists for: a critical section may
+    run far longer than the crash-detection window, because a live holder says
+    so. Without it, the two are the same number and you must choose between
+    supporting long work and noticing a crash promptly.
+
+    Every other test here holds for less than one recovery window, so this is
+    the only one that exercises renewal at all.
+    """
+    monitor = Monitor()
+    hold_s = DEAD_HOLDER_MS / 1000 * 2.5
+
+    waiter_started = asyncio.Event()
+
+    async def waiter():
+        waiter_started.set()
+        await hold(gate, monitor, "waiter", 0.05, acquire_timeout=60, deadline_s=90)
+
+    holder = asyncio.create_task(
+        hold(gate, monitor, "holder", hold_s, acquire_timeout=60, deadline_s=90)
+    )
+    await asyncio.sleep(0.2)
+    queued = asyncio.create_task(waiter())
+    await waiter_started.wait()
+
+    await asyncio.gather(holder, queued)
+
+    monitor.assert_exclusive()
+    assert len(monitor.grants) == 2, monitor.summary()
+
+
+async def test_crashed_holder_is_reclaimed(gate):
+    """
+    A holder that stops renewing must lose the lock, and a waiter must get it.
+
+    The mirror of the test above: renewal has to be what keeps the lease, not
+    something incidental. If this passes while the previous test fails, the
+    implementation cannot tell a long hold from a dead process.
+    """
+    monitor = Monitor()
+
+    grant = await asyncio.wait_for(gate.acquire(timeout=30), timeout=40)
+    monitor.enter("crashed", grant)
+    await gate.abandon(grant)  # process dies here; never releases
+
+    successor = await hold(
+        gate,
+        monitor,
+        "successor",
+        hold_s=0.05,
+        acquire_timeout=gate.recovery_bound_s,
+        deadline_s=gate.recovery_bound_s + 10,
+    )
+
+    assert successor is not None, (
+        f"nobody reclaimed the lock within {gate.recovery_bound_s:.0f}s of the "
+        f"holder dying"
+    )
 
 
 async def test_queue_drains_to_empty(gate):
