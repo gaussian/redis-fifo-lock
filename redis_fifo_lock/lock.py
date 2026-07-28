@@ -199,11 +199,19 @@ class FifoLock:
             )
             return
         if policy and policy != "noeviction":
-            raise RuntimeError(
-                f"redis maxmemory-policy is {policy!r}; this lock's lease key "
-                f"carries a TTL and would be an eviction candidate, which "
-                f"silently releases a held lock. Set the policy to 'noeviction' "
-                f"or give the lock its own Redis."
+            # Warn rather than refuse. Eviction is a real hazard, but it is not
+            # a silent one here: losing the lease key makes the next renewal
+            # fail, so the holder learns within one beat and release() raises.
+            # Refusing to start would take an application down over a setting
+            # its authors may not control, for a failure the lock already
+            # reports.
+            logger.warning(
+                "lock %s: redis maxmemory-policy is %r. This lock's lease key "
+                "carries a TTL, so it is an eviction candidate under memory "
+                "pressure, and evicting it releases a held lock. Prefer "
+                "'noeviction' on this instance, or give the lock its own.",
+                self.name,
+                policy,
             )
 
     # -- public API ---------------------------------------------------------

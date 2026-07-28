@@ -96,9 +96,10 @@ abandoned caller holds the lock until the process restarts.
   makes it a *preferred* victim under any `volatile-*` policy — and evicting it
   silently frees a held lock while leaving the queue intact, so nothing looks
   wrong. Amazon ElastiCache ships `volatile-lru` by default, where Redis itself
-  defaults to `noeviction`. The library checks on first use and refuses to run
-  if the policy is unsafe; if it cannot read the policy, it warns instead. Give
-  the lock a Redis set to `noeviction`, or one of its own.
+  defaults to `noeviction`. The library checks on first use and warns if the
+  policy is unsafe — it does not refuse, because losing the lease key makes the
+  next renewal fail, so the holder finds out within one beat and `release()`
+  raises. Prefer `noeviction` on that instance, or give the lock its own.
 - **Budget a connection per waiter.** A waiter holds one pooled connection while
   it blocks, and redis-py's default pool is 100 — the 101st concurrent waiter in
   a process fails with `MaxConnectionsError`, not a timeout. Raise
