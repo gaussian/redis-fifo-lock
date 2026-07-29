@@ -205,7 +205,7 @@ class FifoLock:
             # Refusing to start would take an application down over a setting
             # its authors may not control, for a failure the lock already
             # reports.
-            logger.warning(
+            logger.error(
                 "lock %s: redis maxmemory-policy is %r. This lock's lease key "
                 "carries a TTL, so it is an eviction candidate under memory "
                 "pressure, and evicting it releases a held lock. Prefer "
@@ -361,7 +361,7 @@ class FifoLock:
                 # starved here is the early warning for two callers running at
                 # once. Either the critical section is blocking the loop or the
                 # lease is sized too tightly for this workload.
-                logger.warning(
+                logger.error(
                     "lock %s: renewal ran %.1fs late against a %.1fs lease; "
                     "something is blocking the event loop",
                     self.name,
