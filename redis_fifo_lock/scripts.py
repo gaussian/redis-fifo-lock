@@ -7,23 +7,29 @@ previous design read the queue in one round trip and dispatched in another, and
 concurrent callers slipped into the gap: six advancers racing on an empty queue
 dispatched six holders, where the fused version dispatches one.
 
-KEYS are the same five everywhere:
+KEYS are the same four everywhere:
     1 {name}:q     ZSET   member = owner, score = pos. The queue.
     2 {name}:h     STRING "owner:fence", PX = lease_ms. Existence IS the lock.
     3 {name}:seq   STRING INCR -> pos. Queue order only, never a token.
     4 {name}:fence STRING INCR -> fence. Minted only when the lock is granted.
-    5 {name}:last  STRING the last fence released, so a retried release is not
-                          mistaken for a lost lease.
+
+Released fences leave a tombstone, {name}:rel:<fence>, PX = 10x lease. Fences
+are minted once and never reused, so the tombstone is unambiguous: a release
+that finds its own fence's tombstone is a redelivered command, not evidence
+that another caller ran alongside. A single shared "last released" slot cannot
+say that - any intervening release overwrites it and turns an ordinary client
+retry into a false corruption alarm.
 
 ARGV[1..3] are always prefix, owner, lease_ms. ARGV[4] varies by script.
 """
 
 # Owner is uuid4().hex, so it never contains ':' and the split is unambiguous.
 _PRELUDE = """
-local KQ, KH, KSEQ, KF, KLAST = KEYS[1], KEYS[2], KEYS[3], KEYS[4], KEYS[5]
+local KQ, KH, KSEQ, KF = KEYS[1], KEYS[2], KEYS[3], KEYS[4]
 local PFX, OWNER, LEASE = ARGV[1], ARGV[2], tonumber(ARGV[3])
 
 local function sig(t) return PFX .. 's:' .. t end
+local function rel(f) return PFX .. 'rel:' .. f end
 
 local function held_by(cur, who)
   return cur and cur ~= false
@@ -103,9 +109,9 @@ local rc, extra = 'OK', ''
 if ARGV[4] ~= '' then
   if held_by(cur, OWNER) and fence_of(cur) == tonumber(ARGV[4]) then
     redis.call('DEL', KH)
-    redis.call('SET', KLAST, ARGV[4], 'PX', LEASE * 10)
+    redis.call('SET', rel(ARGV[4]), '1', 'PX', LEASE * 10)
     rc = 'OK'
-  elseif redis.call('GET', KLAST) == ARGV[4] then
+  elseif redis.call('EXISTS', rel(ARGV[4])) == 1 then
     -- We already released this exact lease; this is a redelivered command, not
     -- evidence that somebody else ran alongside us.
     rc = 'NOOP'

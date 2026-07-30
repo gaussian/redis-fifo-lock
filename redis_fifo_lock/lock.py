@@ -73,11 +73,15 @@ class LeaseLost(Exception):
 class Lease:
     """A held lock. ``fence`` strictly increases with every grant, ever."""
 
-    __slots__ = ("owner", "fence", "pos", "lost", "_beat")
+    __slots__ = ("owner", "fence", "pos", "lost", "releasing", "_beat")
 
     def __init__(self, owner: str, fence: int, pos: int):
         self.owner = owner
         self.fence = fence
+        #: True while release() is in flight. A refused renewal during that
+        #: window is the expected outcome of releasing, not evidence that
+        #: another caller ran alongside — so it must not set ``lost``.
+        self.releasing = False
         #: Queue position assigned on arrival. Grants follow ascending pos —
         #: this is the number FIFO is actually defined against, and it is not
         #: the fence, which is minted later at grant time.
@@ -139,7 +143,7 @@ class FifoLock:
 
         # One hash tag so every key lands in the same Redis Cluster slot.
         self._prefix = f"{{{name}}}:"
-        self._keys = [self._prefix + s for s in ("q", "h", "seq", "fence", "last")]
+        self._keys = [self._prefix + s for s in ("q", "h", "seq", "fence")]
 
         self._acquire = r.register_script(ACQUIRE)
         self._release = r.register_script(RELEASE)
@@ -297,8 +301,17 @@ class FifoLock:
             LeaseLost: we were not the holder any more. Someone else may have
                 been in the critical section at the same time.
         """
-        self._stop_renew(lease)
-        status, _ = await self._call(self._release, lease.owner, str(lease.fence))
+        # Renewal keeps beating until the release lands (stopping it first
+        # would leave the lock un-renewed for the whole round trip), and the
+        # flag stops a refused beat during this window from raising a false
+        # "someone ran alongside you" alarm. The finally stops renewal on
+        # every exit path — a release that RAISES must not leave the lease
+        # renewing until max_hold_ms with nobody able to release it.
+        lease.releasing = True
+        try:
+            status, _ = await self._call(self._release, lease.owner, str(lease.fence))
+        finally:
+            self._stop_renew(lease)
         if status == "STALE":
             raise LeaseLost(
                 f"lease {lease.fence} expired before release; another caller may "
@@ -349,11 +362,14 @@ class FifoLock:
         interval = self.lease_ms / 1000 / BEATS_PER_LEASE
         loop = asyncio.get_event_loop()
         started = loop.time()
+        last_success = started
         alarm = self.lease_ms / 1000 * RENEWAL_LATENESS_ALARM
 
         while True:
             due = loop.time() + interval
             await asyncio.sleep(interval)
+            if lease.releasing:
+                return
 
             late = loop.time() - due
             if late > alarm:
@@ -381,12 +397,31 @@ class FifoLock:
                 return
 
             try:
-                ok = await self._call(self._beat, lease.owner, str(lease.fence))
+                # Bounded: an unbounded await on a half-dead connection would
+                # hang this task forever, renewal would stop silently, and the
+                # holder would never learn its lease lapsed. redis-py discards
+                # a connection whose command was cancelled, so the timeout
+                # cannot poison the pool.
+                ok = await asyncio.wait_for(
+                    self._call(self._beat, lease.owner, str(lease.fence)),
+                    timeout=interval,
+                )
             except Exception:
-                # A blip. lease_ms leaves room for several more attempts.
+                # The server's answer is unknowable, but the clock is not: if
+                # no renewal has confirmed within a full lease, the key has
+                # expired server-side regardless of why our beats are failing.
+                if loop.time() - last_success > self.lease_ms / 1000:
+                    if not lease.releasing:
+                        lease.lost.set()
+                    return
                 continue
-            if not ok:
-                lease.lost.set()
+
+            if ok:
+                last_success = loop.time()
+            else:
+                # Refused: we are no longer the holder.
+                if not lease.releasing:
+                    lease.lost.set()
                 return
 
     def _stop_renew(self, lease: Lease) -> None:
