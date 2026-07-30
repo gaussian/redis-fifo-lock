@@ -7,28 +7,47 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "redis-fifo-lock"
-version = "0.1.3"
+version = "0.2.0"
 description = "Distributed FIFO lock using Redis Streams with strict ordering and crash recovery"
 readme = "redis_fifo_lock/README.md"
 license = "MIT"
 requires-python = ">=3.10"
 dependencies = [
-  "redis[hiredis]>=7.1",                # hiredis speeds up bulk redis performance
-]
-
-[project.optional-dependencies]
-test = [
-  "pytest>=7.0.0",
-  "pytest-asyncio>=0.21.0",
+  "redis[hiredis]>=8,<9",              # hiredis speeds up bulk redis performance
 ]
 
 [project.urls]
 Homepage = "https://github.com/gaussian/redis-fifo-lock"
 Issues = "https://github.com/gaussian/redis-fifo-lock/issues"
 
+[dependency-groups]
+dev = [
+  "pytest>=7.0.0",
+  "pytest-asyncio>=0.21.0",
+  "ruff>=0.10",
+]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# The adversarial suite is slow and randomized on purpose. Keep the everyday
+# run fast; CI runs it explicitly with `-m adversarial` (a -m on the command
+# line overrides this one).
+addopts = "-m 'not adversarial'"
 markers = [
     "integration: marks tests as integration tests (require Redis)",
+    "adversarial: randomized concurrency invariant tests; slow, run on deploy",
+    "slow: long-running tests",
 ]
+
+[tool.ruff.lint]
+# Pin to the classic real-errors rule set (pyflakes + core pycodestyle) rather
+# than ruff's newer, broader default which pulls in style/modernization rules.
+# F401 (side-effect imports / re-exports look unused; F821 still catches
+# genuinely-missing imports) and F841 (intentional unused locals) are excluded.
+select = ["E4", "E7", "E9", "F"]
+ignore = ["F401", "F841"]
+
+[tool.ruff.lint.per-file-ignores]
+# __init__.py uses star imports to re-export the public API.
+"__init__.py" = ["F403"]

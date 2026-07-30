@@ -1,13 +1,12 @@
 """
 Redis Stream-based FIFO lock implementation.
 
-This module provides both synchronous and asynchronous lock-like classes
-that ensure strict FIFO ordering using Redis Streams.
+A distributed FIFO mutex on Redis: callers are served strictly in the order
+Redis saw them arrive, and a holder that dies is detected and replaced.
 """
 
-__version__ = "0.1.3"
+__version__ = "0.2.0"
 
-from redis_fifo_lock.async_gate import AsyncStreamGate
-from redis_fifo_lock.sync import StreamGate
+from redis_fifo_lock.lock import FifoLock, Lease, LeaseLost
 
-__all__ = ["StreamGate", "AsyncStreamGate"]
+__all__ = ["FifoLock", "Lease", "LeaseLost"]
