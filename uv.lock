@@ -214,7 +214,7 @@ hiredis = [
 
 [[package]]
 name = "redis-fifo-lock"
-version = "0.3.0"
+version = "0.3.1"
 source = { editable = "." }
 dependencies = [
     { name = "redis", extra = ["hiredis"] },
