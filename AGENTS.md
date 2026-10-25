@@ -12,6 +12,7 @@ recovery. Published to PyPI.
 - Lint + format: `uv run --all-extras ruff check redis_fifo_lock/ tests/` and
   `ruff format --check redis_fifo_lock/ tests/`
 - Default working branch: `develop`. Releases flow `develop` → `main`.
+- Dependency cooldown: `exclude-newer = "7 days"` under `[tool.uv]` in `pyproject.toml` keeps uv from resolving any release under 7 days old. For an urgent fix, add `<pkg> = false` under `exclude-newer-package`, run `uv lock --upgrade-package <pkg>`, and remove the exemption once that release is over 7 days old.
 
 ## Opening PRs & versioning
 
