@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "redis-fifo-lock"
-version = "0.3.1"
+version = "0.3.2"
 description = "Distributed FIFO lock using Redis Streams with strict ordering and crash recovery"
 readme = "redis_fifo_lock/README.md"
 license = "MIT"
@@ -51,3 +51,7 @@ ignore = ["F401", "F841"]
 [tool.ruff.lint.per-file-ignores]
 # __init__.py uses star imports to re-export the public API.
 "__init__.py" = ["F403"]
+
+[tool.uv]
+# Dependency cooldown: never resolve a release under 7 days old.
+exclude-newer = "7 days"
